@@ -4,8 +4,30 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import omni.isaac.core.utils.prims as prim_utils
 from pxr import Usd
+import types as _types
+import omni
+
+# Try to use Isaac Core prim utils; otherwise provide minimal USD-based fallbacks
+try:
+    import omni.isaac.core.utils.prims as prim_utils  # type: ignore
+except ModuleNotFoundError:
+    def _get_prim_at_path(path: str) -> Usd.Prim:
+        try:
+            stage = omni.usd.get_context().get_stage()
+            return stage.GetPrimAtPath(path)
+        except Exception:
+            # Return an invalid prim object
+            return Usd.Prim()
+
+    def _is_prim_path_valid(path: str) -> bool:
+        try:
+            prim = _get_prim_at_path(path)
+            return prim.IsValid()
+        except Exception:
+            return False
+
+    prim_utils = _types.SimpleNamespace(get_prim_at_path=_get_prim_at_path, is_prim_path_valid=_is_prim_path_valid)
 
 
 def get_all_meshes(env_prim: str) -> tuple[list[Usd.Prim], list[str]]:

@@ -96,6 +96,39 @@ class TerrainAnalysis:
         # get the height of the positions
         return self.height_grid[pos_idx[:, 0], pos_idx[:, 1]]
 
+    def check_clearance(self, positions: torch.Tensor, eps: float = 0.02) -> torch.Tensor:
+        """Check if the given positions have enough clearance from the terrain.
+
+        Args:
+            positions: Coordinates of positions (Shape: [N, 3])
+            eps: Small offset above the terrain to start the raycast
+        Returns:
+            Boolean tensor indicating whether the positions have enough clearance (Shape: [N])
+        """
+        # raycast downwards from the positions
+        ray_directions = torch.zeros((positions.shape[0], 3), dtype=torch.float32, device=self.device)
+        ray_directions[:, 2] = -1.0
+        ray_starts = positions.clone()
+        ray_starts[:, 2] += eps
+
+        if self._raycaster is not None:
+            distance = raycast_mesh(
+                ray_starts=ray_starts.unsqueeze(0),
+                ray_directions=ray_directions.unsqueeze(0),
+                return_distance=True,
+                **self._raycaster_mesh_param,
+            )[1].squeeze(0)
+        else:
+            distance = self._raycast_usd_stage(
+                ray_starts=ray_starts,
+                ray_directions=ray_directions,
+                return_distance=True,
+            )[1]
+
+        # check if the distance is greater than the required clearance
+        return distance > self.cfg.robot_height + eps
+
+
     ###
     # Helper functions
     ###

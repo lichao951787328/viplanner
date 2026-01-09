@@ -1,0 +1,15 @@
+=== Height & Semantic Data Generation Success ===
+Timestamp: 1
+Scene: warehouse
+Grid resolution: 0.1m
+Data shape: (81, 81)
+
+--- Generated Files ---
+✓ height.npy - Surface height map (meters)
+✓ sem_mask.npy - Semantic floor mask (0/1)
+✓ height.png - Height map visualization
+✓ sem_mask.png - Semantic mask visualization
+
+--- Status ---
+Used semantics: True
+Semantic mask successfully generated from floor-only warp mesh.

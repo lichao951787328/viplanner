@@ -40,7 +40,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
             dynamic_friction=1.0,
         ),
         # NOTE: this path should be absolute to load the textures correctly
-        usd_path="${USER_PATH_TO_USD}/carla.usd",
+        usd_path="/home/eai/VLN/viplanner/env/Carla/carla_export/new_carla_export/carla.usd",
         groundplane=True,
         cw_config_file=os.path.join(DATA_DIR, "town01", "cw_multiply_cfg.yml"),
         sem_mesh_to_class_map=os.path.join(DATA_DIR, "town01", "keyword_mapping.yml"),

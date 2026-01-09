@@ -6,14 +6,23 @@
 
 from .unreal_importer import UnRealImporter
 from .unreal_importer_cfg import UnRealImporterCfg
-from .viplanner_matterport_raycast_camera import (
-    VIPlannerMatterportRayCasterCamera,
-    VIPlannerMatterportRayCasterCameraCfg,
-)
 
-__all__ = [
-    "VIPlannerMatterportRayCasterCamera",
-    "VIPlannerMatterportRayCasterCameraCfg",
-    "UnRealImporter",
-    "UnRealImporterCfg",
-]
+# Matterport camera utilities are optional; guard their import to avoid
+# forcing the omni.isaac.matterport dependency in non-matterport runs.
+try:
+    from .viplanner_matterport_raycast_camera import (
+        VIPlannerMatterportRayCasterCamera,
+        VIPlannerMatterportRayCasterCameraCfg,
+    )
+    _HAS_MATTERPORT = True
+except Exception:  # ModuleNotFoundError or any runtime import error
+    VIPlannerMatterportRayCasterCamera = None  # type: ignore
+    VIPlannerMatterportRayCasterCameraCfg = None  # type: ignore
+    _HAS_MATTERPORT = False
+
+__all__ = ["UnRealImporter", "UnRealImporterCfg"]
+if _HAS_MATTERPORT:
+    __all__ += [
+        "VIPlannerMatterportRayCasterCamera",
+        "VIPlannerMatterportRayCasterCameraCfg",
+    ]

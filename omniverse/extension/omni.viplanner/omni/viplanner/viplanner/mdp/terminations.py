@@ -8,7 +8,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import omni.isaac.core.utils.prims as prim_utils
+import types as _types
+import omni
+try:
+    import omni.isaac.core.utils.prims as prim_utils  # type: ignore
+except ModuleNotFoundError:
+    # Minimal USD-based fallback; goal checks will be disabled if goal prim is missing
+    def _get_prim_at_path(path: str):
+        try:
+            stage = omni.usd.get_context().get_stage()
+            return stage.GetPrimAtPath(path)
+        except Exception:
+            return None
+
+    prim_utils = _types.SimpleNamespace(get_prim_at_path=_get_prim_at_path)
 import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
@@ -36,8 +49,14 @@ def at_goal(
     asset: Articulation = env.scene[asset_cfg.name]
 
     # extract goal position
-    goal_pos = prim_utils.get_prim_at_path("/World/goal").GetAttribute("xformOp:translate")
-    goals = torch.tensor(goal_pos.Get(), device=env.device).repeat(env.num_envs, 1)
+    goal_prim = prim_utils.get_prim_at_path("/World/goal")
+    if goal_prim is None or not hasattr(goal_prim, "GetAttribute"):
+        # No goal prim available; never terminate on goal in this run
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    goal_pos_attr = goal_prim.GetAttribute("xformOp:translate")
+    if goal_pos_attr is None:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    goals = torch.tensor(goal_pos_attr.Get(), device=env.device).repeat(env.num_envs, 1)
 
     # Check conditions for termination
     distance_goal = torch.norm(asset.data.root_pos_w[:, :2] - goals[:, :2], dim=1, p=2)

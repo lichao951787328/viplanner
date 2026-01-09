@@ -10,6 +10,13 @@ import carb
 import isaaclab.utils.math as math_utils
 import torch
 import torchvision.transforms as transforms
+from typing import List
+
+try:
+    import omni.usd  # Isaac Sim USD context
+    from pxr import Usd, UsdGeom, Gf
+except Exception:
+    omni = None
 
 
 # Train configuration import (global) so other methods can use it
@@ -73,15 +80,11 @@ class VIPlannerAlgo:
         # init trajectory optimizer
         self.traj_generate = TrajOpt()
 
-        # setup waypoint display in Isaac
-        # in headless mode, we cannot visualize the graph and omni.debug.draw is not available
-        try:
-            import omni.isaac.debug_draw._debug_draw as omni_debug_draw
-
-            self.draw = omni_debug_draw.acquire_debug_draw_interface()
-        except ImportError:
-            print("[WARNING] Graph Visualization is not available in headless mode.")
-            self.draw = None
+        # setup waypoint display in Isaac (support new and old debug_draw APIs)
+        self.draw = None
+        self._draw_warned = False
+        self._draw_acquired_once = False
+        self._try_acquire_debug_draw()
         self.color_fear = [(1.0, 0.4, 0.1, 1.0)]  # red
         self.color_path = [(0.4, 1.0, 0.1, 1.0)]  # green
         self.size = [5.0]
@@ -176,7 +179,13 @@ class VIPlannerAlgo:
 
     def debug_draw(self, paths: torch.Tensor, fear: torch.Tensor, goal: torch.Tensor):
         if getattr(self, "draw", None) is None:
-            return
+            # Lazy acquire after viewport creation
+            self._try_acquire_debug_draw()
+            if self.draw is None:
+                # Fallback: draw as USD BasisCurves when DebugDraw is unavailable
+                self._fallback_draw_curves(paths, fear, goal)
+                return
+        # Native DebugDraw path
         self.draw.clear_lines()
         self.draw.clear_points()
 
@@ -191,3 +200,64 @@ class VIPlannerAlgo:
             else:
                 draw_single_traj(curr_path, self.color_path, self.size)
                 self.draw.draw_points(goal.tolist(), self.color_path * len(goal), self.size * len(goal))
+
+    def _fallback_draw_curves(self, paths: torch.Tensor, fear: torch.Tensor, goal: torch.Tensor):
+        # If USD context is not available, skip
+        try:
+            ctx = omni.usd.get_context()
+            stage = ctx.get_stage()
+            if stage is None:
+                return
+        except Exception:
+            return
+        # Ensure a parent Xform exists
+        root_path = "/World/DebugDraw"
+        try:
+            xform = UsdGeom.Xform.Get(stage, root_path)
+            if not xform:
+                xform = UsdGeom.Xform.Define(stage, root_path)
+        except Exception:
+            return
+        # For each path, update or create a BasisCurves prim
+        for idx, curr_path in enumerate(paths):
+            pts: List[Gf.Vec3f] = [Gf.Vec3f(p[0].item(), p[1].item(), p[2].item()) for p in curr_path]
+            prim_path = f"{root_path}/path_{idx}"
+            try:
+                curves = UsdGeom.BasisCurves.Get(stage, prim_path)
+                if not curves:
+                    curves = UsdGeom.BasisCurves.Define(stage, prim_path)
+                    curves.CreateTypeAttr("linear")
+                    curves.CreateWrapAttr("nonPeriodic")
+                # Update attributes
+                curves.CreateCurveVertexCountsAttr().Set([len(pts)])
+                curves.CreatePointsAttr().Set(pts)
+                curves.CreateWidthsAttr().Set([0.02] * len(pts))
+                color = self.color_fear[0] if fear[idx] > self.fear_threshold else self.color_path[0]
+                curves.CreateDisplayColorAttr().Set([Gf.Vec3f(color[0], color[1], color[2])])
+            except Exception:
+                # Skip on any USD error
+                continue
+
+    def _try_acquire_debug_draw(self):
+        # Prefer Isaac Sim 5.x API
+        try:
+            import isaacsim.util.debug_draw as sim_debug_draw
+            if hasattr(sim_debug_draw, "acquire_debug_draw_interface"):
+                self.draw = sim_debug_draw.acquire_debug_draw_interface()
+            elif hasattr(sim_debug_draw, "get_debug_draw_interface"):
+                self.draw = sim_debug_draw.get_debug_draw_interface()
+        except Exception:
+            pass
+        # Fallback to legacy omni.isaac.debug_draw
+        if self.draw is None:
+            try:
+                import omni.isaac.debug_draw._debug_draw as omni_debug_draw
+                self.draw = omni_debug_draw.acquire_debug_draw_interface()
+            except Exception:
+                pass
+        if self.draw is not None and not self._draw_acquired_once:
+            print("[INFO] DebugDraw interface acquired.")
+            self._draw_acquired_once = True
+        elif self.draw is None and not self._draw_warned:
+            print("[WARNING] DebugDraw interface not available (extension not loaded or headless).")
+            self._draw_warned = True

@@ -67,9 +67,9 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     robot.init_state.pos = (5.0, 5.5, 0.6)
     robot.init_state.rot = (0.5253, 0.0, 0.0, 0.8509)
 
-    # sensors
+    # sensors (decoupled from robot to avoid missing parent prims)
     height_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base",
+        prim_path="/World/sensors/height_scanner",
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
@@ -87,7 +87,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     )
     # camera
     depth_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base/depth_camera",
+        prim_path="/World/sensors/depth_camera",
         offset=CameraCfg.OffsetCfg(pos=(0.510, 0.0, 0.015), rot=(-0.5, 0.5, -0.5, 0.5)),
         spawn=sim_utils.PinholeCameraCfg(),
         width=848,
@@ -97,7 +97,7 @@ class TerrainSceneCfg(InteractiveSceneCfg):
 
     # NOTE: remove "rgb" from the data_types to only render the semantic segmentation
     semantic_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base/semantic_camera",
+        prim_path="/World/sensors/semantic_camera",
         offset=CameraCfg.OffsetCfg(pos=(0.510, 0.0, 0.015), rot=(-0.5, 0.5, -0.5, 0.5)),
         spawn=sim_utils.PinholeCameraCfg(),
         width=1280,

@@ -62,6 +62,37 @@ def nuclear_patch():
             if os.path.exists(p) and p not in sys.path:
                 sys.path.append(p)
 
+        # 7. 解决CXXABI版本问题：优先加载Isaac Sim自带的libstdc++等动态库
+        kit_lib = os.path.join(isaacsim_root, 'kit', 'lib')
+        old_ld = os.environ.get('LD_LIBRARY_PATH', '')
+        def _prepend_ld(path):
+            os.environ['LD_LIBRARY_PATH'] = path + (":" + old_ld if old_ld else "")
+            print(f"[INFO] 已前置到LD_LIBRARY_PATH: {path}")
+        # 优先尝试kit/lib，如果不存在或不包含libstdc++则回退到CONDA_PREFIX/lib
+        if os.path.isdir(kit_lib):
+            try:
+                # 检查是否存在libstdc++文件
+                has_libstdcpp = any(name.startswith('libstdc++') for name in os.listdir(kit_lib))
+            except Exception:
+                has_libstdcpp = False
+            if has_libstdcpp:
+                _prepend_ld(kit_lib)
+            else:
+                conda_lib = os.path.join(conda_base, 'lib') if conda_base else None
+                if conda_lib and os.path.isdir(conda_lib):
+                    _prepend_ld(conda_lib)
+                    print(f"[INFO] kit/lib缺少libstdc++，已回退到CONDA lib: {conda_lib}")
+                else:
+                    print("[WARN] 未找到合适的libstdc++目录，请手动设置LD_LIBRARY_PATH")
+        else:
+            # kit/lib不存在，直接回退到CONDA lib
+            conda_lib = os.path.join(conda_base, 'lib') if conda_base else None
+            if conda_lib and os.path.isdir(conda_lib):
+                _prepend_ld(conda_lib)
+                print(f"[INFO] 未找到kit/lib，已回退到CONDA lib: {conda_lib}")
+            else:
+                print("[WARN] 未找到kit/lib且CONDA lib不可用，请手动设置LD_LIBRARY_PATH")
+
 nuclear_patch()
 print("[SUCCESS] 命名空间与路径已完成全手动强行挂载")
 
@@ -95,17 +126,24 @@ AppLauncher.add_app_launcher_args(parser)
 
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
+# Default to UI mode unless '--headless' is explicitly provided
+try:
+    if "--headless" not in sys.argv:
+        args_cli.headless = False
+except Exception:
+    pass
 
 # launch omniverse app
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+print(f"[INFO] Headless mode: {getattr(args_cli, 'headless', None)}")
 
 """Rest everything follows."""
 # Ensure required Isaac extensions are enabled before importing modules
 try:
     import omni.kit.app
     _ext_mgr = omni.kit.app.get_app().get_extension_manager()
-    for _ext in ("omni.isaac.core", "omni.isaac.ui"):
+    for _ext in ("omni.isaac.core", "omni.isaac.ui", "omni.isaac.debug_draw", "isaacsim.util.debug_draw"):
         try:
             if not _ext_mgr.is_extension_enabled(_ext):
                 _ext_mgr.set_extension_enabled_immediate(_ext, True)
@@ -128,6 +166,7 @@ except ModuleNotFoundError:
     except Exception:
         VisualCuboid = None
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.utils import math as math_utils
 from omni.viplanner.config import (
     ViPlannerCarlaCfg,
     ViPlannerMatterportCfg,
@@ -176,15 +215,49 @@ def main():
     with torch.inference_mode():
         obs = env.reset()[0]
 
+    # Diagnostics: verify cameras and image tensors
+    try:
+        sensor_names = list(env.scene.sensors.keys())
+        print(f"[INFO] Scene sensors: {sensor_names}")
+        if "depth_camera" not in sensor_names or "semantic_camera" not in sensor_names:
+            print("[ERROR] Required cameras missing (depth_camera/semantic_camera).")
+        dep = obs.get("planner_image", {}).get("depth_measurement", None)
+        sem = obs.get("planner_image", {}).get("semantic_measurement", None)
+        if dep is not None and sem is not None:
+            print(f"[INFO] Depth shape: {tuple(dep.shape)}, Semantic shape: {tuple(sem.shape)}")
+            dep_min = torch.nan_to_num(dep).min().item()
+            dep_max = torch.nan_to_num(dep).max().item()
+            sem_min = torch.nan_to_num(sem).min().item()
+            sem_max = torch.nan_to_num(sem).max().item()
+            print(f"[INFO] Depth range: [{dep_min:.3f}, {dep_max:.3f}], Semantic range: [{sem_min:.3f}, {sem_max:.3f}]")
+        else:
+            print("[ERROR] Planner image tensors missing in observations.")
+    except Exception as _e:
+        print(f"[WARN] Camera diagnostics failed: {_e}")
+
     # Optional: place goal ~2m ahead in camera forward when explicitly requested.
     # Enable by: export VIPLANNER_FORWARD_GOAL=1
     if os.environ.get("VIPLANNER_FORWARD_GOAL", "").lower() in ("1", "true", "yes"):
-        cam_pos = obs["planner_transform"]["cam_position"].clone()
-        cam_quat = obs["planner_transform"]["cam_orientation"].clone()
-        forward_cam = torch.tensor([2.0, 0.0, 0.0], device=cam_pos.device)
-        forward_world = math_utils.quat_apply(cam_quat, forward_cam)
-        goal_pos = cam_pos + forward_world
-        goal_pos[2] = 1.0
+        try:
+            cam_pos = obs["planner_transform"]["cam_position"].clone()
+            cam_quat = obs["planner_transform"]["cam_orientation"].clone()
+            forward_cam = torch.tensor([2.0, 0.0, 0.0], device=cam_pos.device, dtype=cam_pos.dtype)
+            forward_world = math_utils.quat_apply(cam_quat, forward_cam)
+            # Flatten shapes like (1, 3) to (3,) to avoid indexing errors
+            if isinstance(forward_world, torch.Tensor):
+                forward_world = forward_world.reshape(-1)
+            cam_pos = cam_pos.reshape(-1)
+            if forward_world is not None and forward_world.numel() == 3 and cam_pos.numel() == 3:
+                # 显式构造三维目标，避免索引边界错误
+                goal_pos = torch.tensor(
+                    [cam_pos[0] + forward_world[0], cam_pos[1] + forward_world[1], 1.0],
+                    device=cam_pos.device,
+                    dtype=cam_pos.dtype,
+                )
+            else:
+                print("[WARN] Forward-goal placement skipped due to invalid shape; using default goal.")
+        except Exception as _e:
+            print(f"[WARN] Forward-goal placement failed ({_e}); using default goal.")
 
     # set goal cube
     VisualCuboid(
@@ -215,6 +288,21 @@ def main():
     viplanner = VIPlannerAlgo(model_dir=args_cli.model_dir, device=env.device)
 
     goals = torch.tensor(goal_pos.Get(), device=env.device).repeat(env.num_envs, 1)
+
+    # One-time probe: draw a simple green line/point to validate DebugDraw
+    try:
+        if getattr(viplanner, "draw", None) is not None:
+            viplanner.draw.clear_lines()
+            viplanner.draw.clear_points()
+            _p0 = [0.0, 0.0, 0.1]
+            _p1 = [0.5, 0.0, 0.1]
+            viplanner.draw.draw_lines([_p0], [_p1], [(0.4, 1.0, 0.1, 1.0)], [5.0])
+            viplanner.draw.draw_points([_p1], [(0.4, 1.0, 0.1, 1.0)], [5.0])
+            print("[INFO] DebugDraw probe line rendered.")
+        else:
+            print("[WARN] DebugDraw interface unavailable (likely headless or extension disabled).")
+    except Exception as _e:
+        print(f"[WARN] DebugDraw probe failed: {_e}")
 
     # initial paths
     _, paths, fear = viplanner.plan_dual(

@@ -6,6 +6,13 @@
 
 from __future__ import annotations
 
+# 说明（中文）：
+# 本文件实现视点采样与渲染的核心逻辑，用于数据采集：
+# 1) 通过 TerrainAnalysis 在地形上构建可通行图（点/边）；
+# 2) 从图中按指定数量采样相机位姿（位置+朝向）；
+# 3) 批量设置相机姿态，渲染并保存深度/语义/RGB等输出及相机内外参。
+# 仅添加注释，不改变原有行为。
+
 import builtins
 import os
 import pickle
@@ -29,56 +36,67 @@ from .viewpoint_sampling_cfg import ViewpointSamplingCfg
 
 
 class ViewpointSampling:
+    """视点采样器：负责采样相机位姿并渲染保存图像/标注。"""
+
     def __init__(self, cfg: ViewpointSamplingCfg, scene: InteractiveScene):
-        # save cfg and env
+        # 保存配置与场景句柄
         self.cfg = cfg
         self.scene = scene
 
-        # get sim context
+        # 获取仿真上下文（用于渲染步进）
         self.sim = SimulationContext.instance()
 
-        # analyse terrains
+        # 地形分析器：按需构建高度图/采样点/可通行图
         self.terrain_analyser = TerrainAnalysis(self.cfg.terrain_analysis, scene=self.scene)
 
-        # initialize viplanner color mapping
+        # 语义配色映射（用于把分割 id 映射成可视化颜色）
         self.viplanner_sem_meta = VIPlannerSemMetaHandler()
 
+# 邻居的“可通行性”和连线过滤是在地形分析阶段一次性完成的，后续取 yaw 时不再重复判定。
+# 地形分析阶段（先做一次，全局准备）
+# 点集构建：采样 XY → 过滤墙体/安全距离/语义 → 得到合法 points（Z=地面+机器人高度）。
+# 边集构建：对每点做 kNN → 过滤穿墙/大高度差/语义代价过高的边 → 得到“无碰撞可行图”。
+# 距离摘要：在图上跑 Dijkstra（截断 max_path_length）→ 记录所有合法的（起点, 可达邻居, 路径长度）到 terrain_analyser.samples。
+# 视点采样阶段（按需抽样，不再做碰撞判定）
+# 选对儿：从 terrain_analyser.samples 随机抽取（起点, 邻居）对儿，邻居与连线已在上一步过滤为“可达/无碰撞/距截断内”。
+# yaw：用“起点→邻居”的方向算 yaw（atan2）。
+# roll/pitch：在 x_angle_range/y_angle_range 范围内做均匀扰动。
+# 位姿：位置取起点，朝向由 yaw+扰动生成四元数；形成最终采样视点并保存/渲染。
+# 核心差异点
+# 邻居判定与连线可通行性是在“建图阶段”统一完成的；采样时只是“从已验证的对儿中挑选并生成姿态”，不会再做碰撞检查。
+# max_path_length 控制“离得不远且可达”的对儿集合，保证采样方向有意义（面向通路/空旷区）。
     def sample_viewpoints(self, nbr_viewpoints: int, seed: int = 1) -> torch.Tensor:
-        """Sample viewpoints for the given number of viewpoints and seed."""
-        # the samples are stored in a torch tensor with the structure
-        # [x, y, z, qw, qx, qv, qz]
-
-        # load viewpoint samples if the exists
+        """按数量与随机种子采样视点，返回 [N,7]=[x,y,z,qw,qx,qy,qz]。"""
+        # 若存在同配置缓存，直接加载
         filename = f"viewpoints_seed{seed}_samples{nbr_viewpoints}.pkl"
         filedir = self.cfg.save_path if self.cfg.save_path else self._get_save_filedir()
         filename = os.path.join(filedir, filename)
         if os.path.isfile(filename):
             with open(filename, "rb") as f:
                 data = pickle.load(f)
-            # add loaded path dict to data dict
             print(f"[INFO] Loaded {nbr_viewpoints} with seed {seed}.")
             return data
         else:
             print(f"[INFO] No viewpoint samples found for seed {seed} and {nbr_viewpoints} samples.")
 
-        # analyse terrain if not done yet
+        # 地形分析（若未完成）
         if not self.terrain_analyser.complete:
             self.terrain_analyser.analyse()
 
-        # set seed
+        # 固定随机种子
         random.seed(seed)
         print(f"[INFO] Start sampling {nbr_viewpoints} viewpoints.")
 
-        # samples are organized in [point_idx, neighbor_idx, distance]
-        # sample from each point the neighbor with the largest distance
+        # 规划从每个点抽取的样本数量（向上取整）
         nbr_samples_per_point = int(np.ceil(nbr_viewpoints / self.terrain_analyser.points.shape[0]).item())
         sample_locations = torch.zeros((nbr_samples_per_point * self.terrain_analyser.points.shape[0], 2))
         sample_locations_count = 0
         curr_point_idx = 0
         while sample_locations_count < nbr_viewpoints:
-            # get samples
+            # 选择当前点的所有候选边
             sample_idx = self.terrain_analyser.samples[:, 0] == curr_point_idx
-            sample_idx_select = torch.randperm(sample_idx.sum())[
+            # 随机选择一部分（避免偏置），保证总量不超过目标
+            sample_idx_select = torch.randperm(sample_idx.sum())[\
                 : min(nbr_samples_per_point, nbr_viewpoints - sample_locations_count)
             ]
             sample_locations[sample_locations_count : sample_locations_count + sample_idx_select.shape[0]] = (
@@ -86,19 +104,18 @@ class ViewpointSampling:
             )
             sample_locations_count += sample_idx_select.shape[0]
             curr_point_idx += 1
-            # reset point index if all points are sampled
             if curr_point_idx >= self.terrain_analyser.points.shape[0]:
                 curr_point_idx = 0
 
         sample_locations = sample_locations[:sample_locations_count].type(torch.int64)
 
-        # get the z angle of the neighbor that is closest to the origin point
+        # 由“起点->邻居”的方向推得 z 轴朝向
         neighbor_direction = (
             self.terrain_analyser.points[sample_locations[:, 0]] - self.terrain_analyser.points[sample_locations[:, 1]]
         )
         z_angles = torch.atan2(neighbor_direction[:, 1], neighbor_direction[:, 0]).to("cpu")
 
-        # vary the rotation of the forward and horizontal axis (in camera frame) as a uniform distribution within the limits
+        # 在给定范围内对 x/y 轴角度做均匀扰动
         x_angles = math_utils.sample_uniform(
             self.cfg.x_angle_range[0], self.cfg.x_angle_range[1], sample_locations_count, device="cpu"
         )
@@ -108,20 +125,20 @@ class ViewpointSampling:
         x_angles = torch.deg2rad(x_angles)
         y_angles = torch.deg2rad(y_angles)
 
+        # 组装输出：位置 + 四元数
         samples = torch.zeros((sample_locations_count, 7))
         samples[:, :3] = self.terrain_analyser.points[sample_locations[:, 0]]
         samples[:, 3:] = math_utils.quat_from_euler_xyz(x_angles, y_angles, z_angles)
 
         print(f"[INFO] Sampled {sample_locations_count} viewpoints.")
 
-        # save samples
+        # 保存采样结果
         os.makedirs(filedir, exist_ok=True)
         with open(filename, "wb") as f:
             pickle.dump(samples, f)
-
         print(f"[INFO] Saved {sample_locations_count} viewpoints with seed {seed} to {filename}.")
 
-        # debug points and orientation
+        # 调试可视化（绿色箭头）
         if self.cfg.debug_viz:
             env_render_steps = 1000
             marker_cfg = GREEN_ARROW_X_MARKER_CFG.copy()
@@ -130,58 +147,50 @@ class ViewpointSampling:
             self.visualizer = VisualizationMarkers(marker_cfg)
             self.visualizer.visualize(samples[:, :3], samples[:, 3:])
 
-            # check if launched from terminal or in extension workflow
             if builtins.ISAAC_LAUNCHED_FROM_TERMINAL is False:
                 print(f"[INFO] Visualizing {sample_locations_count} samples for {env_render_steps} render steps...")
                 for _ in range(env_render_steps):
                     self.sim.render()
-
                 self.visualizer.set_visibility(False)
                 print("[INFO] Done visualizing.")
 
         return samples
 
     def render_viewpoints(self, samples: torch.Tensor):
-        """Render the images at the given viewpoints and save them to the drive."""
+        """按给定视点渲染各相机通道并保存到磁盘。"""
         print(f"[INFO] Start rendering {samples.shape[0]} images.")
 
-        # get number of environments (are the number of cameras)
+        # 每回合可并行渲染的数量 = 环境数
         num_envs = self.scene.num_envs
-        # define how many rounds are necessary to render all viewpoints
         num_rounds = int(np.ceil(samples.shape[0] / num_envs))
-        # image_idx
         image_idx = [0] * len(self.cfg.cameras)
 
-        # save poses
+        # 目录与相机配置
         filedir = self.cfg.save_path if self.cfg.save_path else self._get_save_filedir()
-        # create directories
         os.makedirs(os.path.join(filedir, "semantics"), exist_ok=True)
         os.makedirs(os.path.join(filedir, "depth"), exist_ok=True)
         if "rgb" in self.cfg.cameras.values():
             os.makedirs(os.path.join(filedir, "rgb"), exist_ok=True)
 
-        # save camera configurations
         print(f"[INFO] Saving camera configurations to {filedir}.")
-        # NOTE: the intrinsics of the depth camera have to come first
-        intrinsics = np.zeros((len(self.cfg.cameras), 3, 4))  # saved as ROS Projection matrix
+        intrinsics = np.zeros((len(self.cfg.cameras), 3, 4))  # ROS Projection matrix 3x4
         for cam_idx, cam in enumerate(self.cfg.cameras.keys()):
             intrinsics[cam_idx][:3, :3] = self.scene.sensors[cam].data.intrinsic_matrices[0].cpu().numpy()
         np.savetxt(os.path.join(filedir, "intrinsics.txt"), intrinsics.reshape(-1, 12), delimiter=",")
 
-        # save camera poses (format: x y z qx qy qz qw instead of x y z qw qx qy qz)
+        # 外参顺序：x y z qx qy qz qw（注意与采样时四元数顺序不同）
         np.savetxt(
             os.path.join(filedir, "camera_extrinsic.txt"),
             samples[:, [0, 1, 2, 4, 5, 6, 3]].cpu().numpy(),
             delimiter=",",
         )
 
-        # save images
+        # 渲染与保存
         samples = samples.to(self.scene.device)
         start_time = time.time()
         for i in range(num_rounds):
-            # get samples idx
             samples_idx = torch.arange(i * num_envs, min((i + 1) * num_envs, samples.shape[0]))
-            # set camera positions
+            # 批量设置相机位姿
             for cam in self.cfg.cameras.keys():
                 self.scene.sensors[cam].set_world_poses(
                     positions=samples[samples_idx, :3],
@@ -189,31 +198,23 @@ class ViewpointSampling:
                     env_ids=torch.arange(samples_idx.shape[0]),
                     convention="world",
                 )
-            # update simulation
             self.scene.write_data_to_sim()
-            # perform render steps to fill buffers if usd cameras are used
             if any([isinstance(self.scene.sensors[cam], Camera) for cam in self.cfg.cameras.keys()]):
                 for _ in range(10):
                     self.sim.render()
-            # update scene buffers
             self.scene.update(self.sim.get_physics_dt())
-            # render
+
+            # 逐相机导出
             for cam_idx, (cam, annotator) in enumerate(self.cfg.cameras.items()):
                 image_data_np = self.scene.sensors[cam].data.output[annotator].clone().cpu().numpy()
-                # filter nan
                 image_data_np[np.isnan(image_data_np)] = 0
-                # filter inf
                 image_data_np[np.isinf(image_data_np)] = 0
 
-                # save images
                 for idx in range(samples_idx.shape[0]):
-                    # semantic segmentation
                     if annotator == "semantic_segmentation" or annotator == "rgb":
                         if image_data_np.shape[-1] == 1:
-                            # get info data
                             info = self.scene.sensors[cam].data.info[idx][annotator]["idToLabels"]
-
-                            # assign each key a color from the VIPlanner color space
+                            # 语义 id -> 颜色
                             info = {
                                 int(k): (
                                     self.viplanner_sem_meta.class_color["static"]
@@ -224,9 +225,6 @@ class ViewpointSampling:
                                 )
                                 for k, v in info.items()
                             }
-
-                            # NOTE: the label_ids and the ids in the data might not be the same, label ids might not be continuous and
-                            #       might not start from 0 as well as some data ids might not be present in the label ids
                             unique_data_ids = np.unique(image_data_np)
                             unique_data_ids.sort()
                             mapping = np.zeros(
@@ -241,33 +239,32 @@ class ViewpointSampling:
                             os.path.join(
                                 filedir,
                                 "semantics" if annotator == "semantic_segmentation" else "rgb",
-                                f"{image_idx[cam_idx]}".zfill(4) + ".png"
+                                f"{image_idx[cam_idx]}".zfill(4) + ".png",
                             ),
                             cv2.cvtColor(output.astype(np.uint8), cv2.COLOR_RGB2BGR),
                         )
-                    # depth
                     else:
+                        # 深度：PNG16 + NPY（按 depth_scale 量化/保存）
                         assert cv2.imwrite(
                             os.path.join(filedir, "depth", f"{image_idx[cam_idx]}".zfill(4) + ".png"),
                             np.uint16(image_data_np[idx] * self.cfg.depth_scale),
                         )
-                        # save as npy
                         np.save(
                             os.path.join(filedir, "depth", f"{image_idx[cam_idx]}".zfill(4) + ".npy"),
                             image_data_np[idx] * self.cfg.depth_scale,
                         )
 
                     image_idx[cam_idx] += 1
-
                     if sum(image_idx) % 100 == 0:
                         print(f"[INFO] Rendered {sum(image_idx)} images in {(time.time() - start_time):.4f}s.")
 
-    ###
-    # Safe paths
-    ###
-
     def _get_save_filedir(self) -> str:
-        # get env name
+        """推导默认保存目录：基于地形资源路径构造目录。
+
+        - 如果地形来自 OBJ/PLY（matterport），读取 `obj_filepath`；
+        - 如果来自 USD，读取 `usd_path`；
+        目录规则：<terrain_file_path>/<env_name_without_ext>
+        """
         if hasattr(self.scene.terrain.cfg, "obj_filepath"):
             terrain_file_path = self.scene.terrain.cfg.obj_filepath
         elif hasattr(self.scene.terrain.cfg, "usd_path") and isinstance(self.scene.terrain.cfg.usd_path, str):
@@ -275,7 +272,6 @@ class ViewpointSampling:
         else:
             raise KeyError("Only implemented for terrains loaded from usd and matterport")
         env_name = os.path.splitext(terrain_file_path)[0]
-        # create directory if necessary
         filedir = os.path.join(terrain_file_path, env_name)
         os.makedirs(filedir, exist_ok=True)
         return filedir
