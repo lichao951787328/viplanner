@@ -10,34 +10,16 @@ Collect Training Data for ViPlanner (myself variant)
 - Minimal changes from data_collect.py
 """
 
-"""Launch Isaac Sim Simulator first."""
-
-# 说明（中文）：
-# 本脚本用于在 IsaacLab/Isaac Sim 中生成训练数据（深度/语义/RGB 图像及相机内外参）。
-# 这是“myself” 变体：使用你自定义的 viewpoint_sampling_myself / viewpoint_sampling_cfg_myself。
-
 import argparse
 import sys
+import importlib
+import importlib.util
+import types
 from pathlib import Path
 
-from isaaclab.app import AppLauncher
-
-# add argparse arguments
-parser = argparse.ArgumentParser(description="Data collection for ViPlanner (myself).")
-parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to spawn.")
-parser.add_argument(
-    "--scene", default="warehouse", choices=["matterport", "carla", "warehouse"], type=str, help="Scene to load."
-)
-parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples to generate")
-parser.add_argument("--save_dir", type=str, default=None, help="Directory to save dataset (overrides default)")
-parser.add_argument("--seed", type=int, default=1, help="Random seed for viewpoint sampling")
-
-# append AppLauncher cli args
-AppLauncher.add_app_launcher_args(parser)
-# 将本仓库的 Omniverse 扩展路径加入 PYTHONPATH，确保能以 `omni.viplanner` 方式导入
-# 将扩展根目录加入 sys.path（使得 `omni` 顶层包可被发现）
+# --- 1. 路径与模块设置 (Global Setup) ---
+# 确保在任何情况下（导入或运行）都能找到 omni.viplanner
 _EXT_ROOT = Path(__file__).resolve().parent.parent / "extension"
-# Ensure the real omni.viplanner package is importable (needs parent of 'omni' on sys.path)
 _OMNI_VIPLANNER_PKG = (_EXT_ROOT / "omni.viplanner").as_posix()
 if _OMNI_VIPLANNER_PKG not in sys.path:
     sys.path.insert(0, _OMNI_VIPLANNER_PKG)
@@ -45,26 +27,9 @@ _EXT_ROOT_POSIX = _EXT_ROOT.as_posix()
 if _EXT_ROOT_POSIX not in sys.path:
     sys.path.append(_EXT_ROOT_POSIX)
 
-# parse the arguments
-args_cli = parser.parse_args()
-# 强制启用相机渲染（确保采集管线有相机数据）。
-args_cli.enable_cameras = True
-# launch omniverse app
-app_launcher = AppLauncher(args_cli)
-simulation_app = app_launcher.app
 
-"""Rest everything follows."""
-import isaaclab.sim as sim_utils
-from isaaclab.scene import InteractiveScene
-from isaaclab.sim import SimulationContext
-from isaaclab.utils.timer import Timer
-
-# 使用你的 myself 版本的采样器与配置（绕过 collectors/__init__.py 的副作用导入）
-import importlib
-import importlib.util
-import types
-
-
+# --- 2. 动态加载自定义模块 (Library Loading) ---
+# 将这部分逻辑移到全局，以便其他脚本 import 该文件时能获取到 ViewpointSamplingCfg 类
 _COLLECTORS_DIR = (
     Path(__file__).resolve().parent.parent
     / "extension"
@@ -74,25 +39,81 @@ _COLLECTORS_DIR = (
     / "collectors"
 )
 
-# 构造一个轻量级“包”来承载 myself 模块，保证相对导入（.terrain_analysis_myself）可用
+# 构造一个轻量级“包”来承载 myself 模块
 _PKG_NAME = "ovp_collectors_myself"
 if _PKG_NAME not in sys.modules:
     _pkg = types.ModuleType(_PKG_NAME)
     _pkg.__path__ = [str(_COLLECTORS_DIR)]
     sys.modules[_PKG_NAME] = _pkg
 
-_vp_mod = importlib.import_module(f"{_PKG_NAME}.viewpoint_sampling_myself")
-_vp_cfg_mod = importlib.import_module(f"{_PKG_NAME}.viewpoint_sampling_cfg_myself")
-
-ViewpointSampling = _vp_mod.ViewpointSampling
-ViewpointSamplingCfg = _vp_cfg_mod.ViewpointSamplingCfg
-
-# Defer importing scene configs until we know which scene is requested to avoid
-# pulling in heavy dependencies (e.g., omni.isaac.core) unnecessarily.
+# 尝试加载模块。如果因为缺少仿真环境(Isaac Sim context)导致加载失败，
+# 捕获异常以防止 import 整个文件时崩溃，但在 main 中使用时会再次抛出。
+try:
+    _vp_mod = importlib.import_module(f"{_PKG_NAME}.viewpoint_sampling_myself")
+    _vp_cfg_mod = importlib.import_module(f"{_PKG_NAME}.viewpoint_sampling_cfg_myself")
+    
+    # 暴露给外部调用的类
+    ViewpointSampling = _vp_mod.ViewpointSampling
+    ViewpointSamplingCfg = _vp_cfg_mod.ViewpointSamplingCfg
+except Exception as e:
+    # 这种情况通常发生在 ViewpointSampling 内部直接 import 了 omni.isaac.core
+    # 而当前环境还没有启动 SimulationApp 时。
+    # 我们允许这种情况发生，以便外部脚本至少能 import 这个文件本身而不报错。
+    # 如果外部脚本真的需要使用这些类，它们需要确保环境已就绪。
+    ViewpointSampling = None
+    ViewpointSamplingCfg = None
+    _IMPORT_ERROR = e
+else:
+    _IMPORT_ERROR = None
 
 
 def main():
     """Main function to start the data collection in different environments (myself)."""
+    
+    # --- 3. 参数解析 (Execution Only) ---
+    # 放在 main 内部，只有直接运行此脚本时才会执行
+    from isaaclab.app import AppLauncher
+    
+    parser = argparse.ArgumentParser(description="Data collection for ViPlanner (myself).")
+    parser.add_argument("--num_envs", type=int, default=2, help="Number of environments to spawn.")
+    parser.add_argument(
+        "--scene", default="warehouse", choices=["matterport", "carla", "warehouse"], type=str, help="Scene to load."
+    )
+    parser.add_argument("--num_samples", type=int, default=1000, help="Number of samples to generate")
+    parser.add_argument("--save_dir", type=str, default=None, help="Directory to save dataset (overrides default)")
+    parser.add_argument("--seed", type=int, default=1, help="Random seed for viewpoint sampling")
+
+    # append AppLauncher cli args
+    AppLauncher.add_app_launcher_args(parser)
+    
+    # parse the arguments
+    args_cli = parser.parse_args()
+    
+    # 强制启用相机
+    args_cli.enable_cameras = True
+    
+    # launch omniverse app
+    app_launcher = AppLauncher(args_cli)
+    simulation_app = app_launcher.app
+
+    # --- 4. 仿真环境依赖导入 (Simulation Context) ---
+    # 此时 App 已经启动，可以安全导入 IsaacLab 和 Omni 核心模块
+    import isaaclab.sim as sim_utils
+    from isaaclab.scene import InteractiveScene
+    from isaaclab.sim import SimulationContext
+    from isaaclab.utils.timer import Timer
+    
+    # 检查前面的动态导入是否成功，如果不成功（可能因为之前没启动App），现在重试或报错
+    global ViewpointSampling, ViewpointSamplingCfg
+    if ViewpointSampling is None or ViewpointSamplingCfg is None:
+        if _IMPORT_ERROR:
+             print(f"[INFO] Initial import failed ({_IMPORT_ERROR}), retrying now that SimulationApp is running...")
+        # 再次尝试导入，这次如果失败就是真的失败了
+        _vp_mod = importlib.import_module(f"{_PKG_NAME}.viewpoint_sampling_myself")
+        _vp_cfg_mod = importlib.import_module(f"{_PKG_NAME}.viewpoint_sampling_cfg_myself")
+        ViewpointSampling = _vp_mod.ViewpointSampling
+        ViewpointSamplingCfg = _vp_cfg_mod.ViewpointSamplingCfg
+
     # setup sampling config
     cfg = ViewpointSamplingCfg()
     # 指定用于地形分析的射线传感器
@@ -136,7 +157,7 @@ def main():
         _spec.loader.exec_module(_mod)
         MatterportTerrainSceneCfg = getattr(_mod, "TerrainSceneCfg")
         scene_cfg = MatterportTerrainSceneCfg(1, env_spacing=1.0)
-        # 简化运行：临时关闭语义代价过滤，避免在某些环境缺少 omni.isaac.core 语义接口时报错
+        # 简化运行：临时关闭语义代价过滤
         cfg.terrain_analysis.semantic_cost_mapping = None
     elif args_cli.scene == "carla":
         _cfg_dir = _EXT_ROOT / "omni.viplanner" / "omni" / "viplanner" / "config"
@@ -161,14 +182,14 @@ def main():
         _spec.loader.exec_module(_mod)
         WarehouseTerrainSceneCfg = getattr(_mod, "TerrainSceneCfg")
         scene_cfg = WarehouseTerrainSceneCfg(args_cli.num_envs, env_spacing=1.0)
-        # Enable semantic costs using Carla-style categories (road/sidewalk/floor/wall/etc.)
+        # Enable semantic costs using Carla-style categories
         try:
             from omni.viplanner.config import CarlaSemanticCostMapping
 
             cfg.terrain_analysis.semantic_cost_mapping = CarlaSemanticCostMapping()
         except Exception:
             cfg.terrain_analysis.semantic_cost_mapping = None
-        # Use full terrain extent to avoid empty limiter matches
+        # Use full terrain extent
         cfg.terrain_analysis.dim_limiter_prim = None
     else:
         raise NotImplementedError(f"Scene {args_cli.scene} not yet supported!")
@@ -210,7 +231,7 @@ def main():
     with Timer("[INFO]: Time taken for simulation start", "simulation_start"):
         sim.reset()
 
-    # Verify that terrain meshes are present on the stage and report counts
+    # Verify that terrain meshes are present on the stage
     try:
         from omni.viplanner.collectors.utils import get_all_meshes
 
@@ -247,8 +268,11 @@ def main():
         while simulation_app.is_running():
             sim.render()
             explorer.scene.update(sim_dt)
+    
+    simulation_app.close()
 
 
 if __name__ == "__main__":
+    # 只有当作为主脚本运行时，才执行 main()
+    # 这样其他脚本 import 这个文件时，不会触发 argparse 和 AppLauncher
     main()
-    simulation_app.close()

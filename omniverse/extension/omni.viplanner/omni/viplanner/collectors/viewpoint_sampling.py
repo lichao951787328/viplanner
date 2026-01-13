@@ -110,8 +110,9 @@ class ViewpointSampling:
         sample_locations = sample_locations[:sample_locations_count].type(torch.int64)
 
         # 由“起点->邻居”的方向推得 z 轴朝向
+        # direction from start -> neighbor so camera faces the neighbor
         neighbor_direction = (
-            self.terrain_analyser.points[sample_locations[:, 0]] - self.terrain_analyser.points[sample_locations[:, 1]]
+            self.terrain_analyser.points[sample_locations[:, 1]] - self.terrain_analyser.points[sample_locations[:, 0]]
         )
         z_angles = torch.atan2(neighbor_direction[:, 1], neighbor_direction[:, 0]).to("cpu")
 
@@ -257,6 +258,155 @@ class ViewpointSampling:
                     image_idx[cam_idx] += 1
                     if sum(image_idx) % 100 == 0:
                         print(f"[INFO] Rendered {sum(image_idx)} images in {(time.time() - start_time):.4f}s.")
+
+    def collect_rotated_from_samples(
+        self,
+        save_dir: str | None = None,
+        max_samples: int | None = None,
+        grid_res: float | None = None,
+        size: float = 8.0,
+        camera_height: float = 8.0,
+        save_rgb: bool = True,
+    ) -> int:
+        """
+        使用 TerrainAnalysis 的 samples 集合，按每个 (start, neighbor) 对生成旋转视角的高度图与语义可通行性图。
+
+        行为要点：
+        - yaw = atan2(neighbor_y - start_y, neighbor_x - start_x) （相机朝向邻居）
+        - 不对 x/y 角度做扰动（固定俯视）
+        - 不保存相机内参（按你的要求）
+        - 每个样本保存到 `save_dir/sample_00001/` 子目录下，包含 `height.npy`, `sem_mask.npy`, `camera_pose.npy`，以及可选的 `top_down_rgb.png` 和可视化 PNG
+
+        返回：成功处理的样本数量
+        """
+        from importlib import util as importlib_util
+        from pathlib import Path
+        import sys as _sys
+        import math
+        import numpy as np
+
+        # ensure terrain analysis has been run
+        if not self.terrain_analyser.complete:
+            self.terrain_analyser.analyse()
+
+        # determine save dir
+        filedir = save_dir or (self.cfg.save_path if self.cfg.save_path else self._get_save_filedir())
+        Path(filedir).mkdir(parents=True, exist_ok=True)
+
+        # load rotated helper from standalone script
+        # 在运行时从一个具体文件路径动态加载并执行那个 Python 脚本，把它当成一个模块来用
+        # 找到当前 Python 文件的绝对路径并向上定位到祖先目录（向上 5 层）。
+        repo_root = Path(__file__).resolve().parents[5]
+        # 在上面的 repo_root 下拼接出目标脚本的完整路径（Path 对象）。
+        standalone_path = repo_root / "standalone" / "traversability_grid_rotated_view.py"
+        # 作用：使用 importlib 的工具从指定文件路径创建一个模块规范（ModuleSpec）
+        spec = importlib_util.spec_from_file_location("traversed_rot", standalone_path.as_posix())
+        # 检查 spec 是否成功创建且有可用的 loader；若任一为假则断言失败并抛出异常（提示无法加载该文件）。
+        assert spec and spec.loader, f"Cannot load {standalone_path}"
+        # 基于 ModuleSpec 创建一个空的 module 对象（相当于 types.ModuleType(spec.name)），但尚未执行模块内的代码。
+        mod = importlib_util.module_from_spec(spec)
+        # 将刚创建的 module 对象放到 sys.modules（或 _sys.modules，代码里实际是用别名 _sys）中，键为 spec.name（这里是 "traversed_rot"）。
+        _sys.modules[spec.name] = mod
+        # 通过 spec 的 loader 去执行模块源代码，并把模块的全局名称空间填入 mod（即把文件中的顶层代码运行一遍，模块内定义的函数/类/变量都会出现在 mod 中）。
+        spec.loader.exec_module(mod)
+
+        compute_rotated_maps = getattr(mod, "compute_rotated_maps")
+        render_rotated_rgb = getattr(mod, "render_rotated_rgb")
+
+        # determine grid_res default
+        if grid_res is None and hasattr(self.cfg, "terrain_analysis"):
+            grid_res = getattr(self.cfg.terrain_analysis, "grid_resolution", 0.1)
+        grid_res = float(grid_res)
+
+        samples = self.terrain_analyser.samples.cpu()
+        points = self.terrain_analyser.points.cpu()
+
+        # iterate samples (each row: start_idx, neighbor_idx, path_length)
+        # samples即 terrain_analyser.samples，包含每个采样点的起点索引、邻居索引和路径长度
+        n_total = samples.shape[0]
+        n_processed = 0
+        # 采样队列
+        idx_iter = range(n_total) if max_samples is None else range(min(n_total, max_samples))
+
+        for out_idx, i in enumerate(idx_iter):
+            start_idx = int(samples[i, 0].item())
+            neighbor_idx = int(samples[i, 1].item())
+
+            start_xy = points[start_idx, :2].numpy()
+            neighbor_xy = points[neighbor_idx, :2].numpy()
+
+            dx = neighbor_xy[0] - start_xy[0]
+            dy = neighbor_xy[1] - start_xy[1]
+            yaw_rad = math.atan2(dy, dx)
+            yaw_deg = float(np.degrees(yaw_rad))
+
+            # create per-sample directory
+            sample_dir = Path(filedir) / f"sample_{out_idx+1:05d}"
+            sample_dir.mkdir(parents=True, exist_ok=True)
+
+            print(f"[INFO] Processing sample {out_idx+1}/{min(n_total, max_samples) if max_samples else n_total}: start={start_idx}, neighbor={neighbor_idx}, yaw={yaw_deg:.1f}°")
+
+            # call compute_rotated_maps (returns dict with height & sem_mask)
+            try:
+                result = compute_rotated_maps(self.scene, float(start_xy[0]), float(start_xy[1]), float(size), float(grid_res), float(yaw_deg))
+            except Exception as e:
+                print(f"[WARNING] compute_rotated_maps failed for sample {out_idx+1}: {e}")
+                continue
+
+            # save arrays
+            np.save((sample_dir / "height.npy").as_posix(), result["height"])
+            np.save((sample_dir / "sem_mask.npy").as_posix(), result["sem_mask"])
+
+            # save minimal camera pose
+            camera_pose = {
+                "position": np.array([float(start_xy[0]), float(start_xy[1]), float(camera_height)]),
+                "yaw_deg": float(yaw_deg),
+                "pitch_deg": 0.0,
+                "roll_deg": 90.0,
+            }
+            np.save((sample_dir / "camera_pose.npy").as_posix(), camera_pose)
+
+            # optional RGB render
+            if save_rgb:
+                rgb_path = (sample_dir / "top_down_rgb.png").as_posix()
+                try:
+                    # render_rotated_rgb expects sim and scene from the AppLauncher; use self.sim if available
+                    sim = getattr(self, "sim", None)
+                    if sim is None:
+                        from isaaclab.sim import SimulationContext
+                        sim = SimulationContext.instance()
+                    render_rotated_rgb(sim, self.scene, float(start_xy[0]), float(start_xy[1]), float(camera_height), float(yaw_deg), rgb_path)
+                except Exception as e:
+                    print(f"[WARNING] render_rotated_rgb failed for sample {out_idx+1}: {e}")
+
+            # save visualizations (height.png, sem_mask.png)
+            try:
+                import cv2
+                hg = result["height"]
+                finite = np.isfinite(hg)
+                if finite.any():
+                    hmin = np.nanmin(hg[finite])
+                    hmax = np.nanmax(hg[finite])
+                    denom = (hmax - hmin) if (hmax > hmin) else 1.0
+                    norm = np.clip((hg - hmin) / denom, 0.0, 1.0)
+                    norm[~finite] = 0.0
+                    height_img = (norm * 255).astype(np.uint8)
+                    cv2.imwrite((sample_dir / "height.png").as_posix(), height_img)
+
+                sm = (result["sem_mask"] * 255).astype(np.uint8)
+                cv2.imwrite((sample_dir / "sem_mask.png").as_posix(), sm)
+            except Exception:
+                pass
+
+            # mark success
+            with open((sample_dir / "SUCCESS.txt").as_posix(), "w") as f:
+                f.write("OK\n")
+
+            n_processed += 1
+
+        print(f"[INFO] Finished processing {n_processed} samples, saved to {filedir}")
+        return n_processed
+
 
     def _get_save_filedir(self) -> str:
         """推导默认保存目录：基于地形资源路径构造目录。

@@ -99,7 +99,11 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     semantic_camera = CameraCfg(
         prim_path="/World/sensors/semantic_camera",
         offset=CameraCfg.OffsetCfg(pos=(0.510, 0.0, 0.015), rot=(-0.5, 0.5, -0.5, 0.5)),
-        spawn=sim_utils.PinholeCameraCfg(),
+        # spawn=sim_utils.PinholeCameraCfg(),
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=18.0,         # 默认通常是 24.0mm。减小这个值可以获得更大的视场角
+            horizontal_aperture=20.955  # 传感器宽度，默认为 20.955mm
+        ),
         width=1280,
         height=720,
         data_types=["semantic_segmentation", "rgb"],

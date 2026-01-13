@@ -37,6 +37,7 @@ if _EXT_ROOT_POSIX not in sys.path:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Traversability grid demo with floor-only warp mesh semantics")
     p.add_argument("--scene", default="warehouse", choices=["warehouse", "carla", "matterport"], help="Scene")
+    # 地图分辨率
     p.add_argument("--grid_res", type=float, default=0.25, help="Grid resolution (meters)")
     p.add_argument("--slope_deg", type=float, default=15.0, help="Max slope degrees considered traversable")
     # 表达式：最小距离墙壁的缓冲区
