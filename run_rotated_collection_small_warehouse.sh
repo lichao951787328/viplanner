@@ -13,7 +13,7 @@ export VIPLANNER_DEBUG_SEM=1
 # 默认参数
 SCENE=${1:-warehouse}
 NBR=${2:-8}
-OUT=${3:-./rotated_out}
+OUT=${3:-./rotated_out/warehouse}
 SEED=${4:-1}
 
 # 采集参数

@@ -101,6 +101,7 @@ def main():
         # 启动仿真器
         app_launcher = AppLauncher(args)
         simulation_app = app_launcher.app
+
         
         # 只有在 App 启动后才能导入 Isaac Sim 核心库
         import isaaclab.sim as sim_utils
@@ -133,9 +134,7 @@ def main():
             samples = vs.sample_viewpoints(args.num_samples, seed=args.seed)
             
             # 处理采集
-            vs.collect_rotated_from_samples(save_dir=out_root, max_samples=args.max_samples, 
-                                          grid_res=args.grid_res, size=args.capture_size, 
-                                          camera_height=args.camera_height, save_rgb=True)
+            vs.collect_rotated_from_samples(save_dir=out_root, max_samples=args.max_samples, grid_res=args.grid_res, size=args.capture_size, camera_height=args.camera_height, save_rgb=True)
             
             print("[INFO] Inline sampling complete.")
             simulation_app.close()

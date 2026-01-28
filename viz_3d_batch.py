@@ -180,7 +180,7 @@ def process_single_sample(sample_dir, args):
 
 def main():
     parser = argparse.ArgumentParser(description="Batch convert 2D maps to 3D HTML and PNG")
-    parser.add_argument("--root_dir", type=str, default="/home/eai/VLN/viplanner/rotated_out",
+    parser.add_argument("--root_dir", type=str, default="/home/eai/VLN/viplanner/rotated_out/carla",
                        help="Root directory containing sample_XXXXX subfolders")
     parser.add_argument("--grid_res", type=float, default=0.1)
     

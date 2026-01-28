@@ -50,18 +50,18 @@ class TerrainSceneCfg(InteractiveSceneCfg):
     )
 
     # robots
-    robot = ANYMAL_C_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    # robot = ANYMAL_C_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # sensors
-    height_scanner = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base",
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
-        ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
-        debug_vis=True,
-        mesh_prim_paths=["/World/GroundPlane"],
-    )
-    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, debug_vis=False)
+    # height_scanner = RayCasterCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/base",
+    #     offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.5)),
+    #     ray_alignment="yaw",
+    #     pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+    #     debug_vis=True,
+    #     mesh_prim_paths=["/World/GroundPlane"],
+    # )
+    # contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, debug_vis=False)
     # lights
     light = AssetBaseCfg(
         prim_path="/World/light",
@@ -71,25 +71,39 @@ class TerrainSceneCfg(InteractiveSceneCfg):
         ),
     )
     # camera
-    depth_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base/depth_camera",
-        offset=CameraCfg.OffsetCfg(pos=(0.510, 0.0, 0.015), rot=(-0.5, 0.5, -0.5, 0.5)),
-        spawn=sim_utils.PinholeCameraCfg(
-            focal_length=1.93,
-            horizontal_aperture=3.8,
-        ),
-        width=848,
-        height=480,
-        data_types=["distance_to_image_plane"],
-    )
+    # depth_camera = CameraCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/base/depth_camera",
+    #     offset=CameraCfg.OffsetCfg(pos=(0.510, 0.0, 0.015), rot=(-0.5, 0.5, -0.5, 0.5)),
+    #     spawn=sim_utils.PinholeCameraCfg(
+    #         focal_length=1.93,
+    #         horizontal_aperture=3.8,
+    #     ),
+    #     width=848,
+    #     height=480,
+    #     data_types=["distance_to_image_plane"],
+    # )
 
     # NOTE: remove "rgb" from the data_types to only render the semantic segmentation
+    # semantic_camera = CameraCfg(
+    #     prim_path="{ENV_REGEX_NS}/Robot/base/semantic_camera",
+    #     offset=CameraCfg.OffsetCfg(pos=(0.510, 0.0, 0.015), rot=(-0.5, 0.5, -0.5, 0.5)),
+    #     spawn=sim_utils.PinholeCameraCfg(
+    #         focal_length=1.93,
+    #         horizontal_aperture=3.8,
+    #     ),
+    #     width=1280,
+    #     height=720,
+    #     data_types=["semantic_segmentation", "rgb"],
+    #     colorize_semantic_segmentation=False,
+    # )
+    
     semantic_camera = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/base/semantic_camera",
+        prim_path="/World/sensors/semantic_camera",
         offset=CameraCfg.OffsetCfg(pos=(0.510, 0.0, 0.015), rot=(-0.5, 0.5, -0.5, 0.5)),
+        # spawn=sim_utils.PinholeCameraCfg(),
         spawn=sim_utils.PinholeCameraCfg(
-            focal_length=1.93,
-            horizontal_aperture=3.8,
+            focal_length=18.0,         # 默认通常是 24.0mm。减小这个值可以获得更大的视场角
+            horizontal_aperture=20.955  # 传感器宽度，默认为 20.955mm
         ),
         width=1280,
         height=720,

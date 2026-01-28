@@ -252,73 +252,53 @@ def render_rotated_rgb(sim, scene, center_x, center_y, camera_height, yaw_deg, o
         import traceback
         traceback.print_exc()
         return False
+ 
 
+# check_indoor 表示是否接受室内检查，仅针对室外场景有效
+def compute_rotated_maps(scene, center_x, center_y, size, grid_res, yaw_deg, check_indoor=True, terrain_analyzer=None):
+    # [优化] 如果外部传入了 TA 实例，直接使用，跳过所有初始化开销
+    if terrain_analyzer is not None:
+        ta = terrain_analyzer
+        # 确保 raycaster 已设置 (由于我们在第一步加了缓存检查，这里调用是安全的且快速的)
+        ta._setup_raycaster()
+        
+        # 引入必要的库 (因为没走下面的 import 流程)
+        import numpy as np
+        import torch
+        from isaaclab.utils.warp import raycast_mesh
+        
+        # 注意：这里需要确保 ta 所在的 device 和当前的 scene device 一致
+    else:
+        # === 原有的初始化逻辑 (当作为独立脚本运行时走这里) ===
+        from importlib import util as importlib_util
+        from pathlib import Path as _Path
+        import types as _types
+        import sys as _sys
+        import numpy as np
+        import torch
+        from isaaclab.utils.warp import raycast_mesh
 
-def compute_rotated_maps(scene, center_x, center_y, size, grid_res, yaw_deg):
-    """
-    Generate height and semantic maps in ROTATED local coordinate frame
+        _collectors_dir = _Path(__file__).resolve().parent.parent / "extension" / "omni.viplanner" / "omni" / "viplanner" / "collectors"
+        # ... (省略原本的 import 代码) ...
+        
+        # 动态加载 TerrainAnalysis
+        # ... (省略原本的 import 代码) ...
+        TerrainAnalysis = getattr(_ta_mod, "TerrainAnalysis")
+        TerrainAnalysisCfg = getattr(_cfg_mod, "TerrainAnalysisCfg")
+
+        # Setup terrain analysis
+        tac = TerrainAnalysisCfg()
+        tac.grid_resolution = grid_res
+        # tac.semantic_cost_mapping = None
+
+        ta = TerrainAnalysis(tac, scene)
+        ta._setup_raycaster()
     
-    Workflow:
-    1. Define local grid in rotated coordinate system (size x size square)
-    2. For each local cell (i, j):
-       - Compute local coordinates (x_local, y_local)
-       - Transform to global coordinates using rotation matrix
-       - Perform raycast in global frame
-    3. Store results in local grid (preserving rotated view)
-    
-    Args:
-        scene: InteractiveScene
-        center_x, center_y: Center position in global frame
-        size: Size of capture region (meters)
-        grid_res: Grid resolution (meters)
-        yaw_deg: Yaw angle in degrees
-    
-    Returns:
-        dict with height_map, sem_mask, etc.
-    """
-    from importlib import util as importlib_util
-    from pathlib import Path as _Path
-    import types as _types
-    import sys as _sys
-
-    _collectors_dir = _Path(__file__).resolve().parent.parent / "extension" / "omni.viplanner" / "omni" / "viplanner" / "collectors"
-    if "omni.viplanner.collectors" not in _sys.modules:
-        _pkg_collectors = _types.ModuleType("omni.viplanner.collectors")
-        _pkg_collectors.__path__ = [_collectors_dir.as_posix()]
-        _sys.modules["omni.viplanner.collectors"] = _pkg_collectors
-
-    _cfg_spec = importlib_util.spec_from_file_location(
-        "omni.viplanner.collectors.terrain_analysis_cfg",
-        (_collectors_dir / "terrain_analysis_cfg.py").as_posix(),
-    )
-    assert _cfg_spec and _cfg_spec.loader
-    _cfg_mod = importlib_util.module_from_spec(_cfg_spec)
-    _sys.modules[_cfg_spec.name] = _cfg_mod
-    _cfg_spec.loader.exec_module(_cfg_mod)
-    TerrainAnalysisCfg = getattr(_cfg_mod, "TerrainAnalysisCfg")
-
-    _ta_spec = importlib_util.spec_from_file_location(
-        "omni.viplanner.collectors.terrain_analysis_myself",
-        (_collectors_dir / "terrain_analysis_myself.py").as_posix(),
-    )
-    assert _ta_spec and _ta_spec.loader
-    _ta_mod = importlib_util.module_from_spec(_ta_spec)
-    _sys.modules[_ta_spec.name] = _ta_mod
-    _ta_spec.loader.exec_module(_ta_mod)
-    TerrainAnalysis = getattr(_ta_mod, "TerrainAnalysis")
-
-    from isaaclab.utils.warp import raycast_mesh
-    import torch
-
-    # Setup terrain analysis
-    tac = TerrainAnalysisCfg()
-    tac.grid_resolution = grid_res
-    tac.semantic_cost_mapping = None
-
-    ta = TerrainAnalysis(tac, scene)
-    ta._setup_raycaster()
-
     # Compute rotation matrix
+    
+    # [注意] 如果上面用了 terrain_analyzer，需要确保 numpy 被导入了
+    if 'np' not in locals(): import numpy as np
+    
     yaw_rad = np.deg2rad(yaw_deg)
     rot_matrix = rotation_matrix_z(yaw_rad)
     
@@ -342,35 +322,11 @@ def compute_rotated_maps(scene, center_x, center_y, size, grid_res, yaw_deg):
     print(f"  Local grid: {num_points}x{num_points} points")
     print(f"  Local bounds: x=[{-half_size:.2f}, {half_size:.2f}], y=[{-half_size:.2f}, {half_size:.2f}]")
     
-    # Transform local points to GLOBAL coordinates
-    # For each (x_local, y_local), compute (x_global, y_global):
-    #   [x_global]   [x_center]       [x_local]
-    #   [y_global] = [y_center] + R * [y_local]
-    
     local_points = np.stack([X_local.flatten(), Y_local.flatten()], axis=1)  # (N, 2)
     global_points_center = local_points @ rot_matrix.T  # Rotate: (N, 2) @ (2, 2)
     global_points_center[:, 0] += center_x  # Translate X
     global_points_center[:, 1] += center_y  # Translate Y
-    
-    # X_global = global_points[:, 0].reshape(X_local.shape)
-    # Y_global = global_points[:, 1].reshape(Y_local.shape)
-    
-    # print(f"  Global bounds: x=[{X_global.min():.2f}, {global_points_center.max():.2f}], y=[{Y_global.min():.2f}, {Y_global.max():.2f}]")
-    
-    
-    # -----------新修改的在这
-    # --- [STRATEGY] 5-Point Pattern Generation ---
-    # Offset delta: 1/4 of grid resolution to stay inside the cell but away from center
-    delta = grid_res * 0.25
-    
-    # Base Global Points: (N, 2)
-    # We want to create (N*5, 2)
-    
-    # Define offsets in GLOBAL frame? 
-    # No, it's safer to define in LOCAL frame and rotate, but for small delta, 
-    # fixed global offsets work fine for jittering. 
-    # Let's simply apply offsets to the computed global centers.
-    
+    delta = grid_res * 0.25    
     n_pixels = global_points_center.shape[0]
     
     # shape: (N, 5, 2)
@@ -390,12 +346,17 @@ def compute_rotated_maps(scene, center_x, center_y, size, grid_res, yaw_deg):
     # Flatten to (N*5, 2) for batch raycast
     batch_global_points = expanded_points.reshape(-1, 2)
     
-    # Raycast parameters
-    raycast_start_height = 2.0
-    raycast_max_dist = 2.2
-    # hit_threshold = raycast_start_height - 0.1 # Valid hit must be below this Z
+    # ---------------------------------------------
+    # 0. 准备 Raycast 参数
+    # ---------------------------------------------
+    # 这里的 raycast_start_height 是发射源的高度。
+    # 确保这个高度高于你场景中的大部分地面，否则射线从地下往下打会直接 miss。
+    # 比如设为 2.0 或更高 (根据你的场景需求)
+    raycast_start_height = 2.0  
+    # 最大探测距离。如果 start=2.0, max_dist=2.2，说明只能探测到 Z=-0.2 以上的地面
+    raycast_max_dist = 2.5      
     
-    # Prepare Tensor 为每个采样点生成一组“从空中往下打”的射线起点和方向，用于后续的raycast（射线投射）操作，常用于地形高度或障碍物检测
+    # 生成射线起点 (N*5, 3)
     grid_points_down = torch.from_numpy(
         np.column_stack([
             batch_global_points[:, 0],
@@ -403,132 +364,122 @@ def compute_rotated_maps(scene, center_x, center_y, size, grid_res, yaw_deg):
             np.ones(len(batch_global_points)) * raycast_start_height
         ])
     ).float().to(ta.device)
-    # 这一步把所有采样点的XY坐标和统一的Z高度拼成一个 (N, 3) 的三维坐标数组，表示每条射线的起点。
+    
+    # 生成射线方向 (向下)
     direction_down = torch.zeros_like(grid_points_down)
     direction_down[:, 2] = -1.0
     
     # ---------------------------------------------
-    # Step 1: Ground Raycast (Multi-Sampled)
+    # Step 1: 地面高度检测 (Raycast Ground)
     # ---------------------------------------------
     print(f"\n[DEBUG] Step 1: Raycast Ground (Batch size: {len(batch_global_points)})")
     
-    # 未击中的点返回的为inf,见网页https://isaac-sim.github.io/IsaacLab/main/_modules/isaaclab/utils/warp/ops.html#raycast_mesh
+    # 向下发射射线，获取击中点
     ground_hit = raycast_mesh(
         ray_starts=grid_points_down.unsqueeze(0),
         ray_directions=direction_down.unsqueeze(0),
-        max_dist=1e6,
+        max_dist=1e6, # 先用大距离拿到点，后续再根据 max_dist 过滤 NaN
         mesh=ta._warp_mesh,
-    )[0].squeeze(0)
+    )[0].squeeze(0) # shape (N*5, 3)
+
+    # ---------------------------------------------
+    # Step 1.1: 室内点检测与过滤 (Indoor Check)
+    # ---------------------------------------------
+    is_indoor_mask = None
     
-    # 打印 ground_hit 中大于 raycast_max_dist 的坐标
-    ground_hit_np = ground_hit.cpu().numpy()
-    mask_gt = ground_hit_np[:, 2] > raycast_max_dist
-    if np.any(mask_gt):
-        print(f"[DEBUG] ground_hit > raycast_max_dist ({raycast_max_dist}):")
-        idxs = np.where(mask_gt)[0]
-        for idx in idxs:
-            x, y, z = ground_hit_np[idx]
-            print(f"  idx={idx}: (x={x:.3f}, y={y:.3f}, z={z:.3f})")
-    else:
-        print(f"[DEBUG] No ground_hit z > raycast_max_dist ({raycast_max_dist})")
-    
-    # Raw Z values (N*5, )
+    if check_indoor:
+        # [逻辑修正]: 基于"击中点"来判断是否在室内，而不是基于半空中的"发射点"
+        # 1. 克隆击中点坐标
+        check_origins = ground_hit.clone()
+        
+        # 2. 只有“有效击中”的点才需要检查室内 (如果是 inf 无穷远，说明没地，不用查)
+        #    这里简单起见，我们对所有点做检查，但 check_if_indoor 内部最好能处理 inf 的情况
+        #    将检查点从地面抬高 0.5m (模拟机器人高度)，进行四周探测
+        check_origins[:, 2] += 0.5 
+        
+        # 3. 调用室内检测函数 (注意：使用原始 mesh)
+        #    max_dist 设为室内墙壁判定的阈值 (如 3.0m - 5.0m)
+        is_indoor_mask = ta.check_if_indoor(check_origins, max_dist=5.0) 
+        
+        num_indoor = is_indoor_mask.sum().item()
+        if num_indoor > 0:
+            print(f"[DEBUG] Detected {num_indoor} indoor points to be filtered.")
+
+    # ---------------------------------------------
+    # Step 1.2: 处理高度图数据
+    # ---------------------------------------------
+    # 获取 Z 轴高度 (N*5, )
     raw_z = ground_hit[:, 2].cpu().numpy()
     
-    # 检查raw_z每一列是否全大于2.9，如果是则打印该列编号
-    z_grouped = raw_z.reshape(n_pixels, 5)
-    for col in range(z_grouped.shape[1]):
-        if np.all(z_grouped[:, col] > raycast_max_dist):
-            print(f"[WARNING] All values in column {col} of raw_z are > {raycast_max_dist}")
+    # [关键过滤]: 如果是室内点，将其高度设为 NaN
+    if is_indoor_mask is not None:
+        indoor_np = is_indoor_mask.cpu().numpy()
+        raw_z[indoor_np] = np.nan
 
-    # 1. Reshape back to (N, 5)
+    # 数据重塑 (N, 5)
     z_grouped = raw_z.reshape(n_pixels, 5)
     
-    # 2. Filter Misses: Set misses to NaN
-    # Miss condition: value > raycast_max_dist (e.g. returns 3.0)
-    mask_miss = z_grouped > raycast_max_dist
+    # 过滤未击中的点 (Misses): 如果 Z > raycast_start_height + buffer 或者距离过远
+    # 注意：raycast_mesh 返回的是世界坐标 Z。
+    # 简单的判定：如果 Z 坐标过低(打穿了) 或者 距离发射点过远，都视为无效
+    # 这里沿用你的逻辑：判断距离是否超过阈值
+    # 计算距离: start_z - hit_z
+    dists = raycast_start_height - z_grouped
+    mask_miss = (dists > raycast_max_dist) | (dists < 0) # 距离过大 或 在发射点上方
+    
     z_grouped_filtered = z_grouped.copy()
     z_grouped_filtered[mask_miss] = np.nan
     
-    # 统计 z_grouped_filtered 为 nan 的点并打印其坐标
-    # nan_mask = np.isnan(z_grouped_filtered)
-    # nan_indices = np.argwhere(nan_mask)
-    # if nan_indices.size > 0:
-    #     print(f"[INFO] Number of NaN points in z_grouped_filtered: {nan_indices.shape[0]}")
-    #     for idx in nan_indices:
-    #         pixel_idx, sample_idx = idx
-    #         x_local, y_local = local_points[pixel_idx]
-    #         x_global, y_global = global_points_center[pixel_idx]
-    #         print(f"  NaN at pixel={pixel_idx}, sample={sample_idx}: local=({x_local:.2f}, {y_local:.2f}), global=({x_global:.2f}, {y_global:.2f})")
-    # else:
-    #     print("[INFO] No NaN points found in z_grouped_filtered.")
-    # 3. Statistical Aggregation: NanMedian
-    # Ignores NaNs. If [0.0, 3.0, 0.0, 3.0, 0.0] -> Median([0,0,0]) = 0.0 (Correct!)
-    # If all NaNs -> returns NaN
+    # 取中位数得到最终高度
     ground_height_agg = np.nanmedian(z_grouped_filtered, axis=1)
-    
-    # 统计 ground_height_agg 为 nan 的点并打印其坐标
-    # nan_mask = np.isnan(ground_height_agg)
-    # if np.any(nan_mask):
-    #     nan_indices = np.where(nan_mask)[0]
-    #     print(f"[INFO] Number of NaN ground points: {len(nan_indices)}")
-    #     for idx in nan_indices:
-    #         x_local, y_local = local_points[idx]
-    #         x_global, y_global = global_points_center[idx]
-    #         print(f"  NaN at grid idx={idx}: local=({x_local:.2f}, {y_local:.2f}), global=({x_global:.2f}, {y_global:.2f})")
-    # else:
-    #     print("[INFO] No NaN ground points found.")
-            
-    # Reshape to grid
     height_map = ground_height_agg.reshape(X_local.shape)
     
-    # # === 生成临时二值图像: 有数据为白, 无数据为黑 ===
-    # # height_map: np.ndarray, shape=(H, W)
-    # # 有数据: np.isfinite(height_map)
-    # binary_img = np.zeros_like(height_map, dtype=np.uint8)
-    # binary_img[np.isfinite(height_map)] = 255
-    # # binary_img 现在是一个二值图像, 有数据为255(白), 无数据为0(黑)
-    # import cv2
-    # cv2.imwrite(os.path.join(out_dir, "height_valid_mask.png"), binary_img)
-    
     valid_count = np.sum(np.isfinite(ground_height_agg))
-    print(f"[DEBUG]   Valid Ground Points (after median filtering): {valid_count}/{n_pixels} ({100*valid_count/n_pixels:.1f}%)")
+    print(f"[DEBUG] Valid Ground Points: {valid_count}/{n_pixels}")
 
     # ---------------------------------------------
-    # Step 2: Obstacle Check (Multi-Sampled)
+    # Step 2: 障碍物检测 (Obstacle Check)
     # ---------------------------------------------
     print(f"\n[DEBUG] Step 2: Check for obstacles")
     
     has_obstacle_agg = np.zeros(n_pixels, dtype=bool)
     
+    # 初始化击中矩阵 (False 表示没障碍)
+    is_hit_matrix = np.zeros((n_pixels, 5), dtype=bool)
+
+    # 2.1 物理障碍物检测 (针对 _warp_mesh_obstacles)
     if hasattr(ta, "_warp_mesh_obstacles") and ta._warp_mesh_obstacles is not None:
         obstacle_hit = raycast_mesh(
             ray_starts=grid_points_down.unsqueeze(0),
             ray_directions=direction_down.unsqueeze(0),
-            max_dist=raycast_max_dist,
+            max_dist=raycast_max_dist, # 障碍物也只检测在这个距离内的
             mesh=ta._warp_mesh_obstacles,
         )[0].squeeze(0)
         
         obs_z_raw = obstacle_hit[:, 2].cpu().numpy()
         obs_z_grouped = obs_z_raw.reshape(n_pixels, 5)
         
-        # Determine valid obstacle hits
-        # Hit is valid if Z < raycast_max_dist
-        is_hit_matrix = (obs_z_grouped < raycast_max_dist) & np.isfinite(obs_z_grouped)
-        
-        # Aggregation: Conservative "OR"
-        # If ANY of the 5 rays hit an obstacle, the cell is an obstacle.
-        # This prevents "thin obstacle" tunneling.
-        
-        has_obstacle_agg = np.any(is_hit_matrix, axis=1)
-        
-        print(f"[DEBUG]   Obstacles detected: {has_obstacle_agg.sum()}")
+        # 如果击中点的距离在范围内，且是有限值，则视为障碍物
+        obs_dists = raycast_start_height - obs_z_grouped
+        is_hit_matrix = (obs_dists < raycast_max_dist) & (obs_dists > 0) & np.isfinite(obs_z_grouped)
+
+    # 2.2 [关键逻辑] 融合室内检测结果
+    # 如果该点被判定为室内，也将其视为障碍物(不可通行)
+    if is_indoor_mask is not None:
+        indoor_reshaped = is_indoor_mask.cpu().numpy().reshape(n_pixels, 5)
+        # 取并集：物理障碍物 OR 室内点 = 不可通行
+        is_hit_matrix = is_hit_matrix | indoor_reshaped
+
+    # 聚合：5个采样点中只要有一个是障碍物，该网格即为障碍物
+    has_obstacle_agg = np.any(is_hit_matrix, axis=1)
     
-    # Final Traversability Logic
-    # 1. Ground must be valid (not NaN)
-    # 2. Must not have obstacle
-    # is_traversable = np.isfinite(ground_height_agg) & ~has_obstacle_agg
-    is_traversable = ~has_obstacle_agg
+    print(f"[DEBUG] Obstacles detected: {has_obstacle_agg.sum()}")
+    
+    # ---------------------------------------------
+    # Step 3: 生成语义掩码
+    # ---------------------------------------------
+    # 可通行 = (地面高度有效) AND (没有障碍物)
+    is_traversable = np.isfinite(ground_height_agg) & ~has_obstacle_agg
     
     sem_mask = is_traversable.astype(np.uint8).reshape(X_local.shape)
     
@@ -542,300 +493,6 @@ def compute_rotated_maps(scene, center_x, center_y, size, grid_res, yaw_deg):
         "rotation_matrix": rot_matrix,
         "used_semantics": True,
     }
-    
-    
-    
-    # # Raycast parameters
-    # raycast_start_height = 3.0
-    # raycast_max_dist = 3.1
-    
-    # print(f"\n[DEBUG] Step 1: Raycast DOWN to find ground height")
-    # print(f"  start_height={raycast_start_height}m, max_dist={raycast_max_dist}m")
-    
-    # # Single-sample raycast (can add multi-sampling if needed)
-    # grid_points_down = torch.from_numpy(
-    #     np.column_stack([
-    #         X_global.flatten(),
-    #         Y_global.flatten(),
-    #         np.ones_like(X_global.flatten()) * raycast_start_height
-    #     ])
-    # ).float().to(ta.device)
-    
-    # direction_down = torch.zeros_like(grid_points_down)
-    # direction_down[:, 2] = -1.0  # Point down
-    
-    # ground_hit = raycast_mesh(
-    #     ray_starts=grid_points_down.unsqueeze(0),
-    #     ray_directions=direction_down.unsqueeze(0),
-    #     max_dist=raycast_max_dist,
-    #     mesh=ta._warp_mesh,
-    # )[0].squeeze(0)
-    
-    # ground_height = ground_hit[:, 2].cpu().numpy()
-    
-    # # Debug
-    # valid_ground = ground_height[np.isfinite(ground_height)]
-    # if len(valid_ground) > 0:
-    #     print(f"[DEBUG]   Ground found: {len(valid_ground)}/{len(ground_height)} points ({100*len(valid_ground)/len(ground_height):.1f}%)")
-    #     print(f"[DEBUG]   Ground height range: [{valid_ground.min():.2f}, {valid_ground.max():.2f}] meters")
-    # else:
-    #     print(f"[WARNING]   No ground found!")
-    #     return {
-    #         "height": np.full(X_local.shape, np.nan),
-    #         "sem_mask": np.zeros(X_local.shape, dtype=np.uint8),
-    #         "center": (center_x, center_y),
-    #         "yaw_deg": yaw_deg,
-    #         "grid_res": grid_res,
-    #         "used_semantics": False,
-    #     }
-    
-    # # Reshape to local grid
-    # height_map = ground_height.reshape(X_local.shape)
-    
-    # # Step 2: Check for obstacles
-    # print(f"\n[DEBUG] Step 2: Check for obstacles")
-    
-    # has_obstacle = None
-    # if hasattr(ta, "_warp_mesh_obstacles") and ta._warp_mesh_obstacles is not None:
-    #     grid_points_down_obstacle = torch.from_numpy(
-    #         np.column_stack([
-    #             X_global.flatten(),
-    #             Y_global.flatten(),
-    #             np.ones_like(X_global.flatten()) * raycast_start_height
-    #         ])
-    #     ).float().to(ta.device)
-        
-    #     direction_down_obstacle = torch.zeros_like(grid_points_down_obstacle)
-    #     direction_down_obstacle[:, 2] = -1.0
-        
-    #     obstacle_hit_result = raycast_mesh(
-    #         ray_starts=grid_points_down_obstacle.unsqueeze(0),
-    #         ray_directions=direction_down_obstacle.unsqueeze(0),
-    #         max_dist=raycast_max_dist,
-    #         mesh=ta._warp_mesh_obstacles,
-    #     )[0].squeeze(0)
-        
-    #     has_obstacle = torch.isfinite(obstacle_hit_result[:, 2]).cpu().numpy()
-    #     print(f"[DEBUG]   Obstacles detected: {has_obstacle.sum()}/{len(has_obstacle)} points ({100*has_obstacle.sum()/len(has_obstacle):.1f}%)")
-        
-    #     # Traversability
-    #     is_traversable = np.isfinite(ground_height) & ~has_obstacle
-    # else:
-    #     print(f"[WARNING]   No obstacle mesh available")
-    #     is_traversable = np.isfinite(ground_height)
-    
-    # # Compute semantic mask
-    # sem_mask = is_traversable.astype(np.uint8).reshape(X_local.shape)
-    # print(f"[DEBUG]   Traversable points: {sem_mask.sum()}/{sem_mask.size} ({100*sem_mask.sum()/sem_mask.size:.1f}%)")
-    
-    # return {
-    #     "height": height_map,
-    #     "sem_mask": sem_mask,
-    #     "center": (center_x, center_y),
-    #     "yaw_deg": yaw_deg,
-    #     "grid_res": grid_res,
-    #     "size": size,
-    #     "rotation_matrix": rot_matrix,
-    #     "used_semantics": True,
-    # }
-
-
-# def compute_rotated_maps(scene, center_x, center_y, size, grid_res, yaw_deg):
-#     """
-#     Generate height and semantic maps in ROTATED local coordinate frame
-#     (Robust Version: Uses 5-point multi-sampling to fix raycast leaks)
-#     """
-#     from importlib import util as importlib_util
-#     from pathlib import Path as _Path
-#     import types as _types
-#     import sys as _sys
-#     import numpy as np
-#     import torch
-#     from isaaclab.utils.warp import raycast_mesh
-#     from isaaclab.utils.math import rotation_matrix_z
-
-#     # --- Module Loading Logic (Keep unchanged) ---
-#     _collectors_dir = _Path(__file__).resolve().parent.parent / "extension" / "omni.viplanner" / "omni" / "viplanner" / "collectors"
-#     if "omni.viplanner.collectors" not in _sys.modules:
-#         _pkg_collectors = _types.ModuleType("omni.viplanner.collectors")
-#         _pkg_collectors.__path__ = [_collectors_dir.as_posix()]
-#         _sys.modules["omni.viplanner.collectors"] = _pkg_collectors
-
-#     _cfg_spec = importlib_util.spec_from_file_location("omni.viplanner.collectors.terrain_analysis_cfg", (_collectors_dir / "terrain_analysis_cfg.py").as_posix())
-#     assert _cfg_spec and _cfg_spec.loader
-#     _cfg_mod = importlib_util.module_from_spec(_cfg_spec)
-#     _sys.modules[_cfg_spec.name] = _cfg_mod
-#     _cfg_spec.loader.exec_module(_cfg_mod)
-#     TerrainAnalysisCfg = getattr(_cfg_mod, "TerrainAnalysisCfg")
-
-#     _ta_spec = importlib_util.spec_from_file_location("omni.viplanner.collectors.terrain_analysis_myself", (_collectors_dir / "terrain_analysis_myself.py").as_posix())
-#     assert _ta_spec and _ta_spec.loader
-#     _ta_mod = importlib_util.module_from_spec(_ta_spec)
-#     _sys.modules[_ta_spec.name] = _ta_mod
-#     _ta_spec.loader.exec_module(_ta_mod)
-#     TerrainAnalysis = getattr(_ta_mod, "TerrainAnalysis")
-#     # ---------------------------------------------
-
-#     # Setup terrain analysis
-#     tac = TerrainAnalysisCfg()
-#     tac.grid_resolution = grid_res
-#     tac.semantic_cost_mapping = None
-
-#     ta = TerrainAnalysis(tac, scene)
-#     ta._setup_raycaster()
-
-#     # Compute rotation matrix
-#     yaw_rad = np.deg2rad(yaw_deg)
-#     rot_matrix = rotation_matrix_z(yaw_rad)
-    
-#     print(f"\n{'='*60}")
-#     print(f"[INFO] Computing maps (Robust Multi-Sampling x5)")
-#     print(f"{'='*60}")
-    
-#     # Create LOCAL grid
-#     num_points = int(np.round(size / grid_res)) + 1
-#     half_size = size / 2.0
-#     xs_local = np.linspace(-half_size, half_size, num_points)
-#     ys_local = np.linspace(-half_size, half_size, num_points)
-#     X_local, Y_local = np.meshgrid(xs_local, ys_local, indexing='ij')
-#     original_shape = X_local.shape
-    
-#     # Transform to GLOBAL (Central Points)
-#     local_points = np.stack([X_local.flatten(), Y_local.flatten()], axis=1) # (N, 2)
-#     global_points_center = local_points @ rot_matrix.T
-#     global_points_center[:, 0] += center_x
-#     global_points_center[:, 1] += center_y
-    
-#     # --- [STRATEGY] 5-Point Pattern Generation ---
-#     # Offset delta: 1/4 of grid resolution to stay inside the cell but away from center
-#     delta = grid_res * 0.25
-    
-#     # Base Global Points: (N, 2)
-#     # We want to create (N*5, 2)
-    
-#     # Define offsets in GLOBAL frame? 
-#     # No, it's safer to define in LOCAL frame and rotate, but for small delta, 
-#     # fixed global offsets work fine for jittering. 
-#     # Let's simply apply offsets to the computed global centers.
-    
-#     n_pixels = global_points_center.shape[0]
-    
-#     # shape: (N, 5, 2)
-#     expanded_points = np.zeros((n_pixels, 5, 2), dtype=np.float32)
-    
-#     # 1. Center
-#     expanded_points[:, 0, :] = global_points_center
-#     # 2. Right (+x)
-#     expanded_points[:, 1, :] = global_points_center + np.array([delta, 0])
-#     # 3. Left (-x)
-#     expanded_points[:, 2, :] = global_points_center + np.array([-delta, 0])
-#     # 4. Up (+y)
-#     expanded_points[:, 3, :] = global_points_center + np.array([0, delta])
-#     # 5. Down (-y)
-#     expanded_points[:, 4, :] = global_points_center + np.array([0, -delta])
-    
-#     # Flatten to (N*5, 2) for batch raycast
-#     batch_global_points = expanded_points.reshape(-1, 2)
-    
-#     # Raycast parameters
-#     raycast_start_height = 3.0
-#     raycast_max_dist = 3.1
-#     hit_threshold = raycast_start_height - 0.1 # Valid hit must be below this Z
-    
-#     # Prepare Tensor 为每个采样点生成一组“从空中往下打”的射线起点和方向，用于后续的raycast（射线投射）操作，常用于地形高度或障碍物检测
-#     grid_points_down = torch.from_numpy(
-#         np.column_stack([
-#             batch_global_points[:, 0],
-#             batch_global_points[:, 1],
-#             np.ones(len(batch_global_points)) * raycast_start_height
-#         ])
-#     ).float().to(ta.device)
-#     # 这一步把所有采样点的XY坐标和统一的Z高度拼成一个 (N, 3) 的三维坐标数组，表示每条射线的起点。
-#     direction_down = torch.zeros_like(grid_points_down)
-#     direction_down[:, 2] = -1.0
-    
-#     # ---------------------------------------------
-#     # Step 1: Ground Raycast (Multi-Sampled)
-#     # ---------------------------------------------
-#     print(f"\n[DEBUG] Step 1: Raycast Ground (Batch size: {len(batch_global_points)})")
-    
-#     ground_hit = raycast_mesh(
-#         ray_starts=grid_points_down.unsqueeze(0),
-#         ray_directions=direction_down.unsqueeze(0),
-#         max_dist=raycast_max_dist,
-#         mesh=ta._warp_mesh,
-#     )[0].squeeze(0)
-    
-#     # Raw Z values (N*5, )
-#     raw_z = ground_hit[:, 2].cpu().numpy()
-    
-#     # 1. Reshape back to (N, 5)
-#     z_grouped = raw_z.reshape(n_pixels, 5)
-    
-#     # 2. Filter Misses: Set misses to NaN
-#     # Miss condition: value > hit_threshold (e.g. returns 3.0)
-#     mask_miss = z_grouped > hit_threshold
-#     z_grouped_filtered = z_grouped.copy()
-#     z_grouped_filtered[mask_miss] = np.nan
-    
-#     # 3. Statistical Aggregation: NanMedian
-#     # Ignores NaNs. If [0.0, 3.0, 0.0, 3.0, 0.0] -> Median([0,0,0]) = 0.0 (Correct!)
-#     # If all NaNs -> returns NaN
-#     ground_height_agg = np.nanmedian(z_grouped_filtered, axis=1)
-    
-#     # Reshape to grid
-#     height_map = ground_height_agg.reshape(original_shape)
-    
-#     valid_count = np.sum(np.isfinite(ground_height_agg))
-#     print(f"[DEBUG]   Valid Ground Points (after median filtering): {valid_count}/{n_pixels} ({100*valid_count/n_pixels:.1f}%)")
-
-#     # ---------------------------------------------
-#     # Step 2: Obstacle Check (Multi-Sampled)
-#     # ---------------------------------------------
-#     print(f"\n[DEBUG] Step 2: Check for obstacles")
-    
-#     has_obstacle_agg = np.zeros(n_pixels, dtype=bool)
-    
-#     if hasattr(ta, "_warp_mesh_obstacles") and ta._warp_mesh_obstacles is not None:
-#         obstacle_hit = raycast_mesh(
-#             ray_starts=grid_points_down.unsqueeze(0),
-#             ray_directions=direction_down.unsqueeze(0),
-#             max_dist=raycast_max_dist,
-#             mesh=ta._warp_mesh_obstacles,
-#         )[0].squeeze(0)
-        
-#         obs_z_raw = obstacle_hit[:, 2].cpu().numpy()
-#         obs_z_grouped = obs_z_raw.reshape(n_pixels, 5)
-        
-#         # Determine valid obstacle hits
-#         # Hit is valid if Z < hit_threshold
-#         is_hit_matrix = (obs_z_grouped < hit_threshold) & np.isfinite(obs_z_grouped)
-        
-#         # Aggregation: Conservative "OR"
-#         # If ANY of the 5 rays hit an obstacle, the cell is an obstacle.
-#         # This prevents "thin obstacle" tunneling.
-#         has_obstacle_agg = np.any(is_hit_matrix, axis=1)
-        
-#         print(f"[DEBUG]   Obstacles detected: {has_obstacle_agg.sum()}")
-    
-#     # Final Traversability Logic
-#     # 1. Ground must be valid (not NaN)
-#     # 2. Must not have obstacle
-#     is_traversable = np.isfinite(ground_height_agg) & ~has_obstacle_agg
-    
-#     sem_mask = is_traversable.astype(np.uint8).reshape(original_shape)
-    
-#     return {
-#         "height": height_map,
-#         "sem_mask": sem_mask,
-#         "center": (center_x, center_y),
-#         "yaw_deg": yaw_deg,
-#         "grid_res": grid_res,
-#         "size": size,
-#         "rotation_matrix": rot_matrix,
-#         "used_semantics": True,
-#     }
-
 
 def main():
     parser = build_parser()
@@ -875,7 +532,7 @@ def main():
     print(f"{'='*60}\n")
     
     # Generate maps
-    result = compute_rotated_maps(scene, capture_x, capture_y, args.capture_size, args.grid_res, yaw_deg)
+    result = compute_rotated_maps(scene, capture_x, capture_y, args.capture_size, True, args.grid_res, yaw_deg)
     
     # Setup output directory
     out_dir = args.save_dir or os.environ.get("VIPLANNER_DATA_DIR") or str(Path.cwd() / "traversability_rotated_output")

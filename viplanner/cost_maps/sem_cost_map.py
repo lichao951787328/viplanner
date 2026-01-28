@@ -25,7 +25,7 @@ from omni.viplanner.config import (
     VIPlannerSemMetaHandler,
 )
 
-
+# 基于带有语义信息（颜色分类）的三维点云（Point Cloud），构建一个二维的、具备语义信息的、平滑且可微的导航代价地图（Cost Map）。
 class SemCostMap:
     """
     Cost Map based on semantic information
@@ -470,6 +470,9 @@ class SemCostMap:
         traversable_idx = np.where(
             np.round(grid_loss, decimals=self._cfg_sem.round_decimal_traversable) == loss_levels[0]
         )
+        
+        # 1. 最优路径区域 (Traversable): 
+        # 计算到非最优区域的距离，距离越远，代价越低 (变负)。
         grid_loss[traversable_idx] = (
             self._distance_based_gradient(
                 traversable_idx,
@@ -486,6 +489,8 @@ class SemCostMap:
             np.hstack((obs_within_mesh_idx[0], non_classified_idx[~within_mesh, 0])),
             np.hstack((obs_within_mesh_idx[1], non_classified_idx[~within_mesh, 1])),
         )
+        # 2. 障碍物区域 (Obstacles):
+        # 计算到非障碍物的距离，距离越近内部，代价越高 (Log函数)。
         grid_loss[obs_idx] = self._distance_based_gradient(obs_idx, None, None, True)
 
         # repeat distance transform for intermediate loss levels

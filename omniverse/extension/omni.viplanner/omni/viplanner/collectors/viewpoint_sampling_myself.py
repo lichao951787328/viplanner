@@ -249,7 +249,7 @@ class ViewpointSampling:
         import sys as _sys
         import math
         import numpy as np
-
+        # 构建采样图
         if not self.terrain_analyser.complete:
             self.terrain_analyser.analyse()
 
@@ -340,7 +340,7 @@ class ViewpointSampling:
             print(f"[INFO] Processing sample {out_idx+1}/{limit}: start={start_idx}, neighbor={neighbor_idx}, yaw={yaw_deg:.1f}°")
 
             try:
-                result = compute_rotated_maps(self.scene, float(start_xy[0]), float(start_xy[1]), float(size), float(grid_res), float(yaw_deg))
+                result = compute_rotated_maps(self.scene, float(start_xy[0]), float(start_xy[1]), float(size), float(grid_res), float(yaw_deg), True, terrain_analyzer=self.terrain_analyser)
             except Exception as e:
                 print(f"[WARNING] compute_rotated_maps failed for sample {out_idx+1}: {e}")
                 continue
@@ -354,6 +354,12 @@ class ViewpointSampling:
                 "pitch_deg": 0.0,
                 "roll_deg": 90.0,
             }
+            
+            # 保存 camera_pose 到 txt 格式，方便查看
+            np.savetxt((sample_dir / "camera_pose.txt").as_posix(), 
+                       np.array([camera_pose["position"][0], camera_pose["position"][1], camera_pose["position"][2], 
+                                 camera_pose["yaw_deg"], camera_pose["pitch_deg"], camera_pose["roll_deg"]]), 
+                       fmt="%.6f", delimiter=",", header="x,y,z,yaw_deg,pitch_deg,roll_deg")
             np.save((sample_dir / "camera_pose.npy").as_posix(), camera_pose)
 
             if save_rgb:

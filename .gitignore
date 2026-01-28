@@ -1,5 +1,6 @@
 # model files
 ros/planner/models/*
+rotated_out/
 #internal files
 */intern/*
 # beat the planner files

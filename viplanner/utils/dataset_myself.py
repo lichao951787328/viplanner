@@ -43,37 +43,12 @@ class PlannerData(Dataset):
     def __init__(
         self,
         cfg: DataCfg,
-        transform,
         semantics: bool = False,
-        rgb: bool = False,
-        pixel_mean: Optional[np.ndarray] = None,
-        pixel_std: Optional[np.ndarray] = None,
     ) -> None:
-        # """_summary_
-
-        # Args:
-        #     cfg (DataCfg): Dataset COnfiguration
-        #     transform (_type_): Compose torchvision transforms (resize and to tensor)
-        #     semantics (bool, optional): If semantics are used in the network input. Defaults to False.
-        # """
-        # 保存配置和变换函数
         self._cfg = cfg
-        self.transform = transform
         self.semantics = semantics
-        self.rgb = rgb
-        # 确保不会同时使用语义图和RGB图（通常二选一）
-        assert not (semantics and rgb), "Semantics and RGB cannot be used at the same time"
-        self.pixel_mean = pixel_mean
-        self.pixel_std = pixel_std
-
-        # vertical flip transform
-        # 定义水平翻转增强，概率为100%（后续在代码中通过标志位控制是否应用）
-        self.flip_transform = transforms.RandomHorizontalFlip(p=1.0)
 
         # init buffers # 初始化数据缓存列表
-        self.depth_filename: List[str] = []
-        self.sem_rgb_filename: List[str] = []
-        self.depth_imgs: List[torch.Tensor] = []
         self.sem_imgs: List[torch.Tensor] = []
         self.odom: torch.Tensor = None
         self.goal: torch.Tensor = None
@@ -85,14 +60,12 @@ class PlannerData(Dataset):
     # 填充数据到缓存
     def update_buffers(
         self,
-        depth_filename: List[str],
         sem_rgb_filename: List[str],
         odom: torch.Tensor,
         goal: torch.Tensor,
         pair_augment: np.ndarray,
     ) -> None:
         #  这个函数通常由 Generator 调用，将生成好的数据列表注入到 Dataset 中
-        self.depth_filename = depth_filename
         self.sem_rgb_filename = sem_rgb_filename
         self.odom = odom
         self.goal = goal
@@ -105,181 +78,535 @@ class PlannerData(Dataset):
 
     """Augment Images with black polygons"""
 
-    # 数据增强：随机遮挡
-    def _add_random_polygons(self, image, nb_polygons, max_size):
-        # 在图像上随机画黑色的多边形，模拟遮挡或传感器缺失，提高模型鲁棒性
-        for i in range(nb_polygons):
-            num_corners = random.randint(10, 20)
-            polygon_points = np.random.randint(0, max_size, size=(num_corners, 2))
-            x_offset = np.random.randint(0, image.shape[0])
-            y_offset = np.random.randint(0, image.shape[1])
-            polygon_points[:, 0] += x_offset
-            polygon_points[:, 1] += y_offset
-
-            # Create a convex hull from the points  # ... 生成随机顶点坐标 ...
-            hull = cv2.convexHull(polygon_points)
-
-            # Draw the hull on the image
-            cv2.fillPoly(image, [hull], (0, 0, 0))
-        return image
-
-    """Load images"""
-
-    # 加载深度图和语义/RGB图到内存
-    def load_data_in_memory(self) -> None:
-        #  读取深度图文件
-        """Load data into RAM to speed up training"""
-        for idx in tqdm(range(len(self.depth_filename)), desc="Load images into RAM"):
-            self.depth_imgs.append(self._load_depth_img(idx))
-            if self.semantics or self.rgb:
-                self.sem_imgs.append(self._load_sem_rgb_img(idx))
-        self.load_ram = True
-        return
-
-    # 加载单张深度图
-    def _load_depth_img(self, idx) -> torch.Tensor:
-        #  读取深度图文件
-        if self.depth_filename[idx].endswith(".png"):
-            depth_image = Image.open(self.depth_filename[idx])
-            if self._cfg.real_world_data:
-                # 真实世界数据可能需要旋转180度（取决于相机安装方式）
-                depth_image = np.array(depth_image.transpose(PIL.Image.ROTATE_180))
+    # 数据增强的辅助函数，具体过程如下：
+    # 模拟视线遮挡--机器人看不到被遮挡的区域
+    # 模拟建图噪声--由于使用occ得到的栅格地图，应该没有椒盐噪声，但有边缘粗糙化
+    # 模拟定位误差--由于视觉里程计的误差，可能会导致部分区域信息缺失
+    # 概率模糊--二值的仿真地图中，锐利的边缘变成渐变边缘
+    # 动态物体残影--在真实 SLAM 中，移动物体可能会在地图上留下一串“鬼影”或者断断续续的障碍点
+    # 模拟丢包和视场受限--相机视场外的区域无法观测到，部分图像区域可能因为传输问题而丢失，视场内被遮挡的部分也无法观测
+    def _add_obstruction_regions(self, image, robot_pos, num_rays=720, max_range=None):
+        """
+        Simulate Lidar-like visibility using Ray Casting and Polygon Filling.
+        
+        Args:
+            image: 2D numpy array (H, W), raw occupancy map (1=obstacle, 0=free)
+                Note: Input image should be binary (0 or 1).
+            robot_pos: (x, y) tuple, robot center in pixel coordinates
+            num_rays: number of rays (increase to 720 or 1080 for better precision)
+            max_range: maximum range in pixels
+            
+        Returns:
+            vis_image: 2D numpy array with:
+                    0.0 = Free (visible space)
+                    0.5 = Unknown (occluded/outside FOV)
+                    1.0 = Occupied (obstacles)
+        """
+        h, w = image.shape
+        x0, y0 = robot_pos
+        
+        # 1. 初始化输出图像为全灰 (Unknown = 0.5)
+        vis_image = np.full_like(image, 0.5, dtype=np.float32)
+        
+        if max_range is None:
+            max_range = np.sqrt(h**2 + w**2)
+        
+        # 2. 生成所有射线的角度
+        angles = np.linspace(0, 2 * np.pi, num_rays, endpoint=False)
+        
+        # 3. 预计算射线的采样点 (向量化操作替代内层循环)
+        # 生成从 0 到 max_range 的距离向量
+        r_step = 1.0 # 步长，越小越精确
+        radii = np.arange(0, max_range, r_step)
+        
+        # 击中点列表 (用于构建可视区域多边形)
+        hit_points = []
+        
+        # 为了加速，我们可以将所有射线放在一个大矩阵里计算，
+        # 但为了代码可读性和内存平衡，这里对每条射线做向量化是足够快的
+        
+        for theta in angles:
+            # 计算该射线路径上所有点的坐标 (X, Y)
+            # x = x0 + r * cos(theta)
+            cos_t = np.cos(theta)
+            sin_t = np.sin(theta)
+            
+            xs = x0 + radii * cos_t
+            ys = y0 + radii * sin_t
+            
+            # 转换为整数索引
+            xs_int = np.rint(xs).astype(np.int32)
+            ys_int = np.rint(ys).astype(np.int32)
+            
+            # 边界检查：找到第一个跑出地图的点
+            valid_mask = (xs_int >= 0) & (xs_int < w) & (ys_int >= 0) & (ys_int < h)
+            
+            # 如果整条射线一开始就出界了(不太可能)，直接跳过
+            if not valid_mask[0]:
+                hit_points.append((int(x0), int(y0)))
+                continue
+                
+            # 截取在地图内的部分
+            valid_len = np.sum(valid_mask)
+            xs_int = xs_int[:valid_len]
+            ys_int = ys_int[:valid_len]
+            
+            # 从地图中提取这些点的值
+            # image[y, x] 注意行列顺序
+            path_values = image[ys_int, xs_int]
+            
+            # 4. 寻找碰撞点 (argmax 找到第一个为 1 的索引)
+            # path_values == 1 生成布尔数组，argmax 返回第一个 True 的下标
+            obstacle_indices = np.where(path_values == 1)[0]
+            
+            if len(obstacle_indices) > 0:
+                # 击中了障碍物
+                hit_idx = obstacle_indices[0]
+                hit_point = (xs_int[hit_idx], ys_int[hit_idx])
+                
+                # 顺便把这个障碍物点在输出图上标记出来
+                vis_image[ys_int[hit_idx], xs_int[hit_idx]] = 1.0
             else:
-                depth_image = np.array(depth_image)
-        else:
-            # 支持 .npy 格式的深度图
-            depth_image = np.load(self.depth_filename[idx])
-        # 处理无效值和归一化（毫米转米）
-        depth_image[~np.isfinite(depth_image)] = 0.0
-        depth_image = (depth_image / 1000.0).astype("float32")
-        depth_image[depth_image > self._cfg.max_depth] = 0.0  # 截断超过最大距离的值
+                # 没击中障碍物，光线在地图边缘或 max_range 处停止
+                hit_point = (xs_int[-1], ys_int[-1])
+                
+            hit_points.append(hit_point)
+            
+        # 5. 核心修复：多边形填充
+        # 将击中点连成一个多边形，内部填充为 0 (Free)
+        # 这解决了射线之间有空隙的问题
+        poly_pts = np.array(hit_points, dtype=np.int32)
+        # 0 代表 Free Space。注意 fillPoly 需要 list of arrays
+        cv2.fillPoly(vis_image, [poly_pts], 0.0)
+        
+        # 6. 重新叠加障碍物 (可选，确保障碍物没有被 fillPoly 覆盖掉)
+        # 这一步是为了锐化边界，因为 fillPoly 可能会把障碍物边缘像素吃掉
+        # 但通常上面的 loop 里已经标了 obstacle，或者我们可以最后把原图的障碍物叠回来
+        # 注意：只有在“可视区域内”的障碍物才应该被标出，所以比较复杂。
+        # 这里建议：上面循环中标记的 obstacle 点是最准确的。
+        # 如果为了防止 fillPoly 覆盖了刚才标记的障碍物点：
+        # 我们再次遍历 hit_points 把它们设回 1 (如果是障碍物的话)
+        
+        # 实际上，更简单的做法是：
+        # fillPoly 填了 0，但我们的逻辑是 0=Free, 0.5=Unknown, 1=Obstacle
+        # 我们需要把刚才 fillPoly 覆盖掉的那个“击中点”恢复成 1
+        
+        # 提取多边形轮廓上的点（即击中点），检查它们在原图是否是障碍物
+        # 如果原图是 1，则 vis_image 设为 1
+        for pt in hit_points:
+            if 0 <= pt[1] < h and 0 <= pt[0] < w:
+                if image[pt[1], pt[0]] == 1:
+                    vis_image[pt[1], pt[0]] = 1.0
 
-        # add noise to depth image # 添加噪声 (椒盐噪声 或 高斯噪声)
-        if self._cfg.depth_salt_pepper or self._cfg.depth_gaussian:
-            depth_norm = (depth_image - np.min(depth_image)) / (np.max(depth_image) - np.min(depth_image))
-            if self._cfg.depth_salt_pepper:
-                depth_norm = random_noise(
-                    depth_norm,
-                    mode="s&p",
+        # 机器人所在位置肯定是 Free
+        vis_image[int(y0), int(x0)] = 0.0
+        
+        return vis_image
+        # 数据增强：随机遮挡
+        def _add_random_polygons(self, image, nb_polygons, max_size):
+            # 在图像上随机画黑色的多边形，模拟遮挡或传感器缺失，提高模型鲁棒性
+            for i in range(nb_polygons):
+                num_corners = random.randint(10, 20)
+                polygon_points = np.random.randint(0, max_size, size=(num_corners, 2))
+                x_offset = np.random.randint(0, image.shape[0])
+                y_offset = np.random.randint(0, image.shape[1])
+                polygon_points[:, 0] += x_offset
+                polygon_points[:, 1] += y_offset
+
+                # Create a convex hull from the points  # ... 生成随机顶点坐标 ...
+                hull = cv2.convexHull(polygon_points)
+
+                # Draw the hull on the image
+                cv2.fillPoly(image, [hull], (0, 0, 0))
+            return image
+
+        """Load images"""
+
+        # 加载深度图和语义/RGB图到内存
+        def load_data_in_memory(self) -> None:
+            #  读取深度图文件
+            """Load data into RAM to speed up training"""
+            for idx in tqdm(range(len(self.depth_filename)), desc="Load images into RAM"):
+                # self.depth_imgs.append(self._load_depth_img(idx))
+                # if self.semantics or self.rgb:
+                #     self.sem_imgs.append(self._load_sem_rgb_img(idx))
+                # ！！！关键：加载时不要加噪声，存纯净图！！！
+                self.depth_imgs.append(self._load_depth_img(idx, augment=False)) 
+            self.load_ram = True
+            return
+
+        # 加载单张深度图
+        def _load_depth_img(self, idx, augment=True) -> torch.Tensor:
+            #  读取深度图文件
+            if self.depth_filename[idx].endswith(".png"):
+                depth_image = Image.open(self.depth_filename[idx])
+                if self._cfg.real_world_data:
+                    # 真实世界数据可能需要旋转180度（取决于相机安装方式）
+                    depth_image = np.array(depth_image.transpose(PIL.Image.ROTATE_180))
+                else:
+                    depth_image = np.array(depth_image)
+            else:
+                # 支持 .npy 格式的深度图
+                depth_image = np.load(self.depth_filename[idx])
+            # 处理无效值和归一化（毫米转米）
+            depth_image[~np.isfinite(depth_image)] = 0.0
+            depth_image = (depth_image / 1000.0).astype("float32")
+            depth_image[depth_image > self._cfg.max_depth] = 0.0  # 截断超过最大距离的值
+
+            # add noise to depth image # 添加噪声 (椒盐噪声 或 高斯噪声)
+            # if self._cfg.depth_salt_pepper or self._cfg.depth_gaussian:
+            #     depth_norm = (depth_image - np.min(depth_image)) / (np.max(depth_image) - np.min(depth_image))
+            #     if self._cfg.depth_salt_pepper:
+            #         depth_norm = random_noise(
+            #             depth_norm,
+            #             mode="s&p",
+            #             amount=self._cfg.depth_salt_pepper,
+            #             clip=False,
+            #         )
+            #     if self._cfg.depth_gaussian:
+            #         depth_norm = random_noise(
+            #             depth_norm,
+            #             mode="gaussian",
+            #             mean=0,
+            #             var=self._cfg.depth_gaussian,
+            #             clip=False,
+            #         )
+            #     depth_image = depth_norm * (np.max(depth_image) - np.min(depth_image)) + np.min(depth_image)
+            # # 添加随机遮挡
+            # if self._cfg.depth_random_polygons_nb and self._cfg.depth_random_polygons_nb > 0:
+            #     depth_image = self._add_random_polygons(
+            #         depth_image,
+            #         self._cfg.depth_random_polygons_nb,
+            #         self._cfg.depth_random_polygon_size,
+            #     )
+
+            if augment:
+                depth_image = self.apply_noise(depth_image)
+
+            # transform depth image 转为 Tensor 并应用 PyTorch transform
+            depth_image = self.transform(depth_image).type(torch.float32)
+            # 如果标记为增强样本，进行水平翻转
+            if self.pair_augment[idx]:
+                depth_image = self.flip_transform.forward(depth_image)
+
+            return depth_image
+
+    # 我给出的结论是：在大多数深度学习与传感器融合的训练场景下，保持不一致（独立）通常效果更好，虽然直觉上觉得“由于物体遮挡，应该两个都看不见”，但从训练鲁棒性的角度来看，独立遮挡更有价值。
+    # 以下是详细的分析：
+    # 1. 这种遮挡模拟的是什么？
+    # 我们需要区分两种“遮挡”：
+    # 类型 A：环境中的物理遮挡（Physical Occlusion）
+    # 例如：一根柱子挡在前面，或者一个人走过。
+    # 表现：在仿真器渲染原始图像时，柱子既会挡住深度相机的视线，也会挡住RGB相机的视线。
+    # 现状：这部分已经由你的仿真器（Omniverse/Gazebo）自然完成了。不需要通过代码里的 _add_random_polygons 来模拟。
+    # 类型 B：传感器本身的数据丢失或污损（Sensor Artifacts / Dropout）
+    # 例如：
+    # 深度相机：强光照射导致红外过曝、黑色吸光物体导致没有回波、镜头上有油污。
+    # RGB/语义相机：镜头上有泥点、图像传输出现丢包导致部分画面花屏、语义分割网络对某块区域分类失败（输出全黑或乱码）。
+    # 现状：这正是 _add_random_polygons 想要模拟的情况。
+        def _load_sem_rgb_img(self, idx) -> torch.Tensor:
+            image = Image.open(self.sem_rgb_filename[idx])
+            if self._cfg.real_world_data:
+                image = np.array(image.transpose(PIL.Image.ROTATE_180))
+            else:
+                image = np.array(image)
+            # normalize image
+            if self.pixel_mean is not None and self.pixel_std is not None:
+                image = (image - self.pixel_mean) / self.pixel_std
+
+            # add noise to semantic image
+            if self._cfg.sem_rgb_black_img:
+                if random.randint(0, 99) < self._cfg.sem_rgb_black_img * 100:
+                    image = np.zeros_like(image)
+            if self._cfg.sem_rgb_pepper:
+                image = random_noise(
+                    image,
+                    mode="pepper",
                     amount=self._cfg.depth_salt_pepper,
                     clip=False,
                 )
-            if self._cfg.depth_gaussian:
-                depth_norm = random_noise(
-                    depth_norm,
-                    mode="gaussian",
-                    mean=0,
-                    var=self._cfg.depth_gaussian,
-                    clip=False,
+            if self._cfg.sem_rgb_random_polygons_nb and self._cfg.sem_rgb_random_polygons_nb > 0:
+                image = self._add_random_polygons(
+                    image,
+                    self._cfg.sem_rgb_random_polygons_nb,
+                    self._cfg.sem_rgb_random_polygon_size,
                 )
-            depth_image = depth_norm * (np.max(depth_image) - np.min(depth_image)) + np.min(depth_image)
-        # 添加随机遮挡
-        if self._cfg.depth_random_polygons_nb and self._cfg.depth_random_polygons_nb > 0:
-            depth_image = self._add_random_polygons(
+
+            # transform semantic image
+            image = self.transform(image).type(torch.float32)
+            assert image.round(decimals=1).max() <= 1.0, (
+                f"Image '{self.sem_rgb_filename[idx]}' is not normalized with max" f" value {image.max().item()}"
+            )
+
+            if self.pair_augment[idx]:
+                image = self.flip_transform.forward(image)
+
+            return image
+
+        """Get image in training"""
+
+        def __len__(self):
+            return len(self.depth_filename)
+
+    # 获取样本
+        def __getitem__(self, idx):
+            """
+            Get batch items
+
+            Returns:
+                - depth_image: depth image
+                - sem_rgb_image: semantic image
+                - odom: odometry of the start pose (point and rotation)
+                - goal: goal point in the camera frame
+                - pair_augment: bool if the pair is augmented (flipped at the y-axis of the image)
+            """
+
+            if self.load_ram:
+                depth_image = self.depth_imgs[idx].copy()  # 注意要copy，防止修改内存中的原图
+            else:
+                # 如果从硬盘读，也不要在这里加噪声，读纯净的
+                depth_image = self._load_depth_img(idx, augment=False)
+            
+            depth_image = self.apply_noise(depth_image)
+            # get depth image
+            if self.load_ram:
+                depth_image = self.depth_imgs[idx]
+                if self.semantics or self.rgb:
+                    sem_rgb_image = self.sem_imgs[idx]
+                else:
+                    sem_rgb_image = 0
+            else:
+                depth_image = self._load_depth_img(idx)
+                if self.semantics or self.rgb:
+                    sem_rgb_image = self._load_sem_rgb_img(idx)
+                else:
+                    sem_rgb_image = 0
+
+            return (
                 depth_image,
-                self._cfg.depth_random_polygons_nb,
-                self._cfg.depth_random_polygon_size,
+                sem_rgb_image,
+                self.odom[idx],     # 当前位姿
+                self.goal[idx],     # 目标点
+                self.pair_augment[idx],     # 是否进行水平翻转增强
             )
 
-        # transform depth image 转为 Tensor 并应用 PyTorch transform
-        depth_image = self.transform(depth_image).type(torch.float32)
-        # 如果标记为增强样本，进行水平翻转
-        if self.pair_augment[idx]:
-            depth_image = self.flip_transform.forward(depth_image)
 
-        return depth_image
-
-# 我给出的结论是：在大多数深度学习与传感器融合的训练场景下，保持不一致（独立）通常效果更好，虽然直觉上觉得“由于物体遮挡，应该两个都看不见”，但从训练鲁棒性的角度来看，独立遮挡更有价值。
-# 以下是详细的分析：
-# 1. 这种遮挡模拟的是什么？
-# 我们需要区分两种“遮挡”：
-# 类型 A：环境中的物理遮挡（Physical Occlusion）
-# 例如：一根柱子挡在前面，或者一个人走过。
-# 表现：在仿真器渲染原始图像时，柱子既会挡住深度相机的视线，也会挡住RGB相机的视线。
-# 现状：这部分已经由你的仿真器（Omniverse/Gazebo）自然完成了。不需要通过代码里的 _add_random_polygons 来模拟。
-# 类型 B：传感器本身的数据丢失或污损（Sensor Artifacts / Dropout）
-# 例如：
-# 深度相机：强光照射导致红外过曝、黑色吸光物体导致没有回波、镜头上有油污。
-# RGB/语义相机：镜头上有泥点、图像传输出现丢包导致部分画面花屏、语义分割网络对某块区域分类失败（输出全黑或乱码）。
-# 现状：这正是 _add_random_polygons 想要模拟的情况。
-    def _load_sem_rgb_img(self, idx) -> torch.Tensor:
-        image = Image.open(self.sem_rgb_filename[idx])
-        if self._cfg.real_world_data:
-            image = np.array(image.transpose(PIL.Image.ROTATE_180))
-        else:
-            image = np.array(image)
-        # normalize image
-        if self.pixel_mean is not None and self.pixel_std is not None:
-            image = (image - self.pixel_mean) / self.pixel_std
-
-        # add noise to semantic image
-        if self._cfg.sem_rgb_black_img:
-            if random.randint(0, 99) < self._cfg.sem_rgb_black_img * 100:
-                image = np.zeros_like(image)
-        if self._cfg.sem_rgb_pepper:
-            image = random_noise(
-                image,
-                mode="pepper",
-                amount=self._cfg.depth_salt_pepper,
-                clip=False,
-            )
-        if self._cfg.sem_rgb_random_polygons_nb and self._cfg.sem_rgb_random_polygons_nb > 0:
-            image = self._add_random_polygons(
-                image,
-                self._cfg.sem_rgb_random_polygons_nb,
-                self._cfg.sem_rgb_random_polygon_size,
-            )
-
-        # transform semantic image
-        image = self.transform(image).type(torch.float32)
-        assert image.round(decimals=1).max() <= 1.0, (
-            f"Image '{self.sem_rgb_filename[idx]}' is not normalized with max" f" value {image.max().item()}"
-        )
-
-        if self.pair_augment[idx]:
-            image = self.flip_transform.forward(image)
-
-        return image
-
-    """Get image in training"""
-
-    def __len__(self):
-        return len(self.depth_filename)
-
-# 获取样本
-    def __getitem__(self, idx):
+    def augment_map_noise(grid_map, 
+                        roughness_prob=0.8, 
+                        morph_prob=0.8,
+                        roughness_intensity=0.1):
         """
-        Get batch items
-
+        模拟建图噪声：边缘粗糙化 + 随机膨胀/腐蚀
+        
+        Args:
+            grid_map: 2D numpy array (H, W), 值为 0 (Free) 或 1 (Obstacle)。
+                    如果是 0-255 的图，请先归一化或修改内部阈值。
+            roughness_prob: 边缘粗糙化发生的概率 (0.0 - 1.0)
+            morph_prob: 膨胀/腐蚀发生的概率 (0.0 - 1.0)
+            roughness_intensity: 粗糙程度，值越大边缘越锯齿 (建议 0.05 - 0.2)
+            
         Returns:
-            - depth_image: depth image
-            - sem_rgb_image: semantic image
-            - odom: odometry of the start pose (point and rotation)
-            - goal: goal point in the camera frame
-            - pair_augment: bool if the pair is augmented (flipped at the y-axis of the image)
+            noisy_map: 处理后的 2D numpy array, 0 或 1
         """
+        
+        # 确保输入是 float 类型以便计算，且是二值的
+        # 如果输入含有 0.5 (Unknown)，建议先分离出障碍物层单独处理
+        noisy_map = grid_map.astype(np.float32).copy()
+        h, w = noisy_map.shape
 
-        # get depth image
-        if self.load_ram:
-            depth_image = self.depth_imgs[idx]
-            if self.semantics or self.rgb:
-                sem_rgb_image = self.sem_imgs[idx]
-            else:
-                sem_rgb_image = 0
-        else:
-            depth_image = self._load_depth_img(idx)
-            if self.semantics or self.rgb:
-                sem_rgb_image = self._load_sem_rgb_img(idx)
-            else:
-                sem_rgb_image = 0
+        # ==========================================
+        # 1. 边缘粗糙化 (Edge Roughness / Jittering)
+        # 原理：先模糊边缘，再叠加高斯噪声，最后重新二值化
+        # ==========================================
+        if random.random() < roughness_prob:
+            # A. 高斯模糊：让锐利的 0/1 边缘变成 0.1, 0.5, 0.9 的渐变带
+            # kernel size 决定了受影响边缘的宽度
+            blur_ksize = random.choice([3, 5]) 
+            blurred = cv2.GaussianBlur(noisy_map, (blur_ksize, blur_ksize), 0)
+            
+            # B. 生成噪声：只在边缘附近产生影响
+            # 噪声让 0.5 的地方可能变成 0.4 或 0.6
+            noise = np.random.randn(h, w) * roughness_intensity
+            
+            # C. 叠加噪声
+            potential_map = blurred + noise
+            
+            # D. 重新阈值化：切断噪声，形成参差不齐的边缘
+            # 0.5 是中间阈值
+            noisy_map = (potential_map > 0.5).astype(np.float32)
 
-        return (
-            depth_image,
-            sem_rgb_image,
-            self.odom[idx],     # 当前位姿
-            self.goal[idx],     # 目标点
-            self.pair_augment[idx],     # 是否进行水平翻转增强
-        )
+        # ==========================================
+        # 2. 随机膨胀/腐蚀 (Random Dilation/Erosion)
+        # 原理：模拟光斑扩散(变胖)或反射率不足(变瘦) 这个是不是可以不要
+        # ==========================================
+        if random.random() < morph_prob:
+            # 转换回 uint8 供 opencv 形态学操作使用
+            morph_map = (noisy_map * 255).astype(np.uint8)
+            
+            # 随机选择核大小 (决定变胖变瘦的幅度)
+            # 3x3 是轻微变化，5x5 是明显变化
+            kernel_size = random.choice([3, 5])
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            
+            # 随机决策：变胖、变瘦、还是(小概率)开闭运算
+            op_type = random.random()
+            
+            if op_type < 0.4:
+                # 膨胀 (Dilate) -> 障碍物变胖 (模拟运动模糊/大光斑)
+                morph_map = cv2.dilate(morph_map, kernel, iterations=1)
+                
+            elif op_type < 0.8:
+                # 腐蚀 (Erode) -> 障碍物变瘦 (模拟点云稀疏/被剔除)
+                morph_map = cv2.erode(morph_map, kernel, iterations=1)
+                
+            else:
+                # 开运算 (Opening) -> 去除孤立噪点，断开细小连接
+                morph_map = cv2.morphologyEx(morph_map, cv2.MORPH_OPEN, kernel)
+
+            # 转回 0/1 float
+            noisy_map = (morph_map > 127).astype(np.float32)
+
+        return noisy_map
+
+
+    def augment_probabilistic_blur(grid_map, blur_prob=0.5, max_sigma=2.0):
+        """
+        模拟概率栅格地图的模糊特性。
+        
+        Args:
+            grid_map: (H, W) float32 array.
+            blur_prob: 执行模糊的概率.
+            max_sigma: 高斯模糊的最大标准差，值越大越模糊.
+            
+        Returns:
+            blurred_map: 模糊后的地图.
+        """
+        if random.random() > blur_prob:
+            return grid_map
+
+        blurred_map = grid_map.copy()
+        
+        # 随机选择模糊核大小 (必须是奇数)
+        k_size = random.choice([3, 5, 7])
+        
+        # 随机选择 sigma (模糊强度)
+        sigma = random.uniform(0.5, max_sigma)
+        
+        # 应用高斯模糊
+        # 这会让 0.0 和 1.0 的边界变成 0.3, 0.6 等中间值
+        blurred_map = cv2.GaussianBlur(blurred_map, (k_size, k_size), sigma)
+        
+        # 保持数值在 [0, 1] 范围内
+        blurred_map = np.clip(blurred_map, 0.0, 1.0)
+        
+        return blurred_map
+    
+    def augment_dynamic_ghosting(grid_map, ghost_prob=0.5, num_ghosts=5, max_ghost_size=5):
+        """
+        模拟动态物体留下的残影 (Ghosting)。
+        在 Free 区域随机撒一些小的障碍物斑点。
+        
+        Args:
+            grid_map: (H, W) float32 array.
+            ghost_prob: 执行操作的概率.
+            num_ghosts: 随机生成多少个残影斑点.
+            max_ghost_size: 残影斑点的最大半径 (像素).
+            
+        Returns:
+            ghost_map: 叠加了残影的地图.
+        """
+        if random.random() > ghost_prob:
+            return grid_map
+            
+        h, w = grid_map.shape
+        ghost_map = grid_map.copy()
+        
+        for _ in range(num_ghosts):
+            # 1. 随机选一个中心点
+            cx = random.randint(0, w - 1)
+            cy = random.randint(0, h - 1)
+            
+            # 为了真实，尽量只在 Free 区域 (0.0) 或 Unknown (0.5) 区域添加，
+            # 如果本来就是墙 (1.0)，加了也没意义
+            if grid_map[cy, cx] > 0.8: 
+                continue
+                
+            # 2. 随机生成斑点的大小和形状
+            # 我们用随机画圆或椭圆来模拟一团噪声
+            axis_x = random.randint(1, max_ghost_size)
+            axis_y = random.randint(1, max_ghost_size)
+            angle = random.randint(0, 180)
+            
+            # 3. 在地图上画出这个残影 (设为 1.0 或一个较高的概率值如 0.8)
+            # 注意：这里直接修改像素值
+            cv2.ellipse(ghost_map, (cx, cy), (axis_x, axis_y), angle, 0, 360, 1.0, -1)
+            
+        return ghost_map
+    
+    def augment_sensor_dropout_fov(grid_map, robot_pos=None, max_range_px=None, dropout_prob=0.3):
+        """
+        模拟 Lidar 最大射程限制和随机扇区丢包。
+        将看不见的地方设为 Unknown (0.5)。
+        
+        Args:
+            grid_map: (H, W) float32 array.
+            robot_pos: (x, y) 机器人在地图上的像素坐标. 如果为 None，默认在地图中心.
+            max_range_px: 最大射程 (像素). 如果为 None，则随机生成一个.
+            dropout_prob: 发生随机丢包的概率.
+            
+        Returns:
+            degraded_map: 视场受限后的地图.
+        """
+        h, w = grid_map.shape
+        if robot_pos is None:
+            robot_pos = (w // 2, h // 2)
+        
+        rx, ry = robot_pos
+        
+        # 创建一个掩码 (Mask): 1 代表可见，0 代表不可见 (Unknown)
+        # 初始全为 0 (全黑/全未知)
+        visibility_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        # ==========================
+        # 1. 模拟最大射程 (FOV Limit)
+        # ==========================
+        if max_range_px is None:
+            # 随机设定一个射程，模拟不同性能的雷达，或者环境导致的衰减
+            # 假设图大概 200x200，射程随机在 60 到 150 之间
+            max_range_px = random.randint(min(h, w)//4, min(h, w)//1)
+            
+        # 在掩码上画一个白色的实心圆，圆内代表探测范围内
+        cv2.circle(visibility_mask, (int(rx), int(ry)), int(max_range_px), 1, -1)
+        
+        # ==========================
+        # 2. 模拟随机丢包 (Dropout) - 扇形缺失
+        # ==========================
+        if random.random() < dropout_prob:
+            # 随机决定丢几个扇区 (Lidar 的某几束光或某个角度的数据包丢了)
+            num_drops = random.randint(1, 3)
+            
+            for _ in range(num_drops):
+                # 随机起始角度和结束角度
+                start_angle = random.randint(0, 360)
+                end_angle = start_angle + random.randint(10, 60) # 丢掉 10~60 度的范围
+                
+                # 在掩码上把这个扇区画黑 (0)，表示变为 Unknown
+                cv2.ellipse(visibility_mask, (int(rx), int(ry)), 
+                            (h, w), # 轴长设得很大以覆盖全图
+                            0, start_angle, end_angle, 0, -1)
+
+        # ==========================
+        # 3. 应用掩码
+        # ==========================
+        degraded_map = grid_map.copy()
+        
+        # 逻辑：
+        # 如果 mask 是 1 (可见)，保留原地图的值
+        # 如果 mask 是 0 (不可见)，强制设为 0.5 (Unknown)
+        degraded_map[visibility_mask == 0] = 0.5
+        
+        return degraded_map
+
 
 
 # 按距离对样本进行分类存储。为了保证数据平衡，代码会将“起点-终点”对按距离分组（例如 1m, 3m, 5m 组），并分别管理
@@ -292,7 +619,6 @@ class DistanceSchemeIdx:
         self.pair_within_fov: List[bool] = []
         self.pair_front_of_robot: List[bool] = []
         self.pair_behind_robot: List[bool] = []
-        self.depth_img_list: List[str] = []
         self.sem_rgb_img_list: List[str] = []
 
         # flags
@@ -1022,7 +1348,6 @@ class PlannerDataGenerator(Dataset):
         front_of_robot: bool = False,
     ):
         # remove all goals depending on the decision tensor from the odom_distances dict
-        # 在这些能走到的点里面，哪些是恰好也在视野内的？
         keep_distance_entries = decision_tensor[list(odom_distances.keys())]
         distances = np.array(list(odom_distances.values()))[keep_distance_entries.numpy()]
         goal_idx = np.array(list(odom_distances.keys()))[keep_distance_entries.numpy()]
@@ -1042,7 +1367,6 @@ class PlannerDataGenerator(Dataset):
             within_curr_distance_idx = distances < distance
             if sum(within_curr_distance_idx) == 0:
                 continue
-            # 从当前符合距离要求的众多候选终点中，随机抽取最多 3 个不重复的终点
             selected_idx = np.random.choice(
                 goal_idx[within_curr_distance_idx],
                 min(3, sum(within_curr_distance_idx)),

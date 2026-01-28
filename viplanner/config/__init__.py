@@ -1,3 +1,11 @@
+'''
+Author: lichao951787328 951787328@qq.com
+Date: 2025-12-31 14:52:20
+LastEditors: lichao951787328 951787328@qq.com
+LastEditTime: 2026-01-20 20:08:53
+FilePath: /viplanner/viplanner/config/__init__.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
 # Copyright (c) 2023-2025, ETH Zurich (Robotics Systems Lab)
 # Author: Pascal Roth
 # All rights reserved.
@@ -12,7 +20,7 @@ from .costmap_cfg import (
     SemCostMapConfig,
     TsdfCostMapConfig,
 )
-from .learning_cfg import DataCfg, TrainCfg
+from .learning_cfg_myself import DataCfg, TrainCfg
 from .viplanner_sem_meta import OBSTACLE_LOSS, VIPlannerSemMetaHandler
 
 __all__ = [

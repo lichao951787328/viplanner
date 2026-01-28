@@ -27,6 +27,7 @@ from isaaclab.scene import InteractiveScene
 from isaaclab.sensors import RayCaster, RayCasterCamera
 from isaaclab.sim import SimulationContext
 from isaaclab.utils.warp import raycast_mesh, convert_to_warp_mesh
+
 try:
     from omni.isaac.matterport.domains import MatterportRayCaster, MatterportRayCasterCamera
 except Exception:
@@ -159,22 +160,31 @@ class TerrainAnalysis:
             heights = np.ones((self.cfg.sample_points, 1)) * self.cfg.wall_height
 
             ray_origins = torch.from_numpy(np.hstack((points, heights))).type(torch.float32).to(self.device)
-
+            # print("--- IGNORE ---")
             # filter points that are outside the mesh or inside walls
             ray_origins, heights = self._point_filter_wall(ray_origins)
-
+            # print("ray origins after wall filter:", ray_origins.shape[0])
             # filter points that are too close to walls
             ray_origins, heights = self._point_filter_wall_closeness(ray_origins, heights)
-
+            
+            if self.cfg.filter_indoor:
+                # print("[INFO] Applying indoor filtering on sampled points...")
+                ray_origins, heights = self._point_filter_indoor(ray_origins, heights)
+            
+            
+            # print("ray origins after wall closeness filter:", ray_origins.shape[0])
             # filter points based on semantic cost
             if self.cfg.semantic_cost_mapping is not None:
+                # print("[INFO] Applying semantic cost filtering on sampled points...")
                 ray_origins, heights = self._point_filter_semantic_cost(ray_origins, heights)
+                # print("ray origins after semantic cost filter:", ray_origins.shape[0])
 
             # set z height of samples to be at the robot's height above the terrain.
             ray_origins[:, 2] = heights + self.cfg.robot_height
 
             sampled_points.append(torch.clone(ray_origins))
             sampled_nb_points += ray_origins.shape[0]
+            print(f"[INFO] Sampled {sampled_nb_points}/{self.cfg.sample_points} points...")
 
         self.points = torch.vstack(sampled_points)
         self.points = self.points[: self.cfg.sample_points]
@@ -182,12 +192,14 @@ class TerrainAnalysis:
 
     def _construct_graph(self):
         # construct kdtree to find nearest neighbors of points
+        print("[INFO] Constructing terrain graph...")
         kdtree = KDTree(self.points.cpu().numpy())
         _, nearest_neighbors_idx = kdtree.query(self.points.cpu().numpy(), k=self.cfg.num_connections + 1, workers=-1)
         # remove first neighbor as it is the point itself
         nearest_neighbors_idx = torch.tensor(nearest_neighbors_idx[:, 1:], dtype=torch.int64, device=self.device)
 
         # filter connections that collide with the environment
+        print("[INFO] Filtering edges based on mesh collisions and height differences...")
         idx_edge_start, idx_edge_end, distance = self._edge_filter_mesh_collisions(nearest_neighbors_idx)
 
         (
@@ -198,7 +210,9 @@ class TerrainAnalysis:
             idx_edge_end_filtered,
         ) = self._edge_filter_height_diff(idx_edge_start, idx_edge_end, distance)
 
+
         # filter edges based on semantic cost
+        print("[INFO] Filtering edges based on semantic cost...")
         if self.cfg.semantic_cost_mapping is not None:
             (
                 idx_edge_start,
@@ -246,60 +260,113 @@ class TerrainAnalysis:
             samples.append(curr_samples)
         self.samples = torch.vstack(samples).to(self.device)
 
-        # debug visualization
+        # --- Matplotlib 2D Graph Visualization (if enabled) ---
         if self.cfg.viz_graph:
-            env_render_steps = 1000
-            if builtins.ISAAC_LAUNCHED_FROM_TERMINAL is False:
-                print(f"[INFO] Visualizing graph. Will do {env_render_steps} render steps...")
-            else:
-                print("[INFO] Visualizing graph.")
-
-            # in headless mode, we cannot visualize the graph and omni.debug.draw is not available
             try:
-                import omni.isaac.debug_draw._debug_draw as omni_debug_draw
+                
+            #     int(np.ceil((self._mesh_dimensions[0] - self._mesh_dimensions[2]) / self.cfg.grid_resolution)),
+            # int(np.ceil((self._mesh_dimensions[1] - self._mesh_dimensions[3]) 
+                import matplotlib.pyplot as plt
+                # 动态设置画布尺寸，基于 mesh 尺寸自动缩放
+                x_size = abs(self._mesh_dimensions[0] - self._mesh_dimensions[2])
+                y_size = abs(self._mesh_dimensions[1] - self._mesh_dimensions[3])
+                # 每个单位长度用 2 英寸，最小 6 英寸，最大 20 英寸
+                fig_width = min(max(x_size * 2, 6), 20)
+                fig_height = min(max(y_size * 2, 6), 20)
+                fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+                fig, ax = plt.subplots(figsize=(10, 10))
+                # 画所有点
+                points_np = self.points.cpu().numpy()
+                ax.scatter(points_np[:, 0], points_np[:, 1], s=8, c="orange", label="Sample Points", alpha=0.8)
+                # 画所有边
+                for start_idx, end_idx in zip(idx_edge_start, idx_edge_end):
+                    x = [points_np[start_idx, 0], points_np[end_idx, 0]]
+                    y = [points_np[start_idx, 1], points_np[end_idx, 1]]
+                    ax.plot(x, y, color="green", linewidth=0.5, alpha=0.5)
+                # 画被过滤掉的边（高度差）
+                for start_idx, end_idx in zip(idx_edge_start_filtered, idx_edge_end_filtered):
+                    x = [points_np[start_idx, 0], points_np[end_idx, 0]]
+                    y = [points_np[start_idx, 1], points_np[end_idx, 1]]
+                    ax.plot(x, y, color="red", linewidth=0.7, alpha=0.7, linestyle="--", label="Filtered (height)" if start_idx == idx_edge_start_filtered[0] and end_idx == idx_edge_end_filtered[0] else "")
+                # 画被过滤掉的边（语义）
+                if self.cfg.semantic_cost_mapping is not None and 'idx_edge_start_filtered_sem' in locals():
+                    for start_idx, end_idx in zip(idx_edge_start_filtered_sem, idx_edge_end_filtered_sem):
+                        x = [points_np[start_idx, 0], points_np[end_idx, 0]]
+                        y = [points_np[start_idx, 1], points_np[end_idx, 1]]
+                        ax.plot(x, y, color="purple", linewidth=0.7, alpha=0.7, linestyle=":", label="Filtered (semantic)" if start_idx == idx_edge_start_filtered_sem[0] and end_idx == idx_edge_end_filtered_sem[0] else "")
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+                ax.set_title("Terrain Graph 2D Visualization")
+                ax.set_aspect("equal")
+                handles, labels = ax.get_legend_handles_labels()
+                by_label = dict(zip(labels, handles))
+                ax.legend(by_label.values(), by_label.keys())
+                plt.tight_layout()
+                output_dir = "/home/eai/VLN/viplanner/viplanner_debug"
+                os.makedirs(output_dir, exist_ok=True)
+                fig_path = os.path.join(output_dir, "terrain_graph_2d.png")
+                plt.savefig(fig_path, dpi=200)
+                plt.close(fig)
+                print(f"[INFO] 2D graph visualization saved to: {fig_path}")
+            except Exception as e:
+                print(f"[WARNING] Failed to plot 2D graph with matplotlib: {e}")
+                    
 
-                draw_interface = omni_debug_draw.acquire_debug_draw_interface()
-                draw_interface.draw_points(
-                    self.points.tolist(),
-                    [(1.0, 0.5, 0, 1)] * self.cfg.sample_points,
-                    [5] * self.cfg.sample_points,
-                )
-                for start_idx, goal_idx in zip(idx_edge_start, idx_edge_end):
-                    draw_interface.draw_lines(
-                        [self.points[start_idx].tolist()],
-                        [self.points[goal_idx].tolist()],
-                        [(0, 1, 0, 1)],
-                        [1],
-                    )
-                for start_idx, goal_idx in zip(idx_edge_start_filtered, idx_edge_end_filtered):
-                    draw_interface.draw_lines(
-                        [self.points[start_idx].tolist()],
-                        [self.points[goal_idx].tolist()],
-                        [(1, 0, 0, 1)],
-                        [1],
-                    )
-                if self.cfg.semantic_cost_mapping is not None:
-                    for start_idx, goal_idx in zip(idx_edge_start_filtered_sem, idx_edge_end_filtered_sem):
-                        draw_interface.draw_lines(
-                            [self.points[start_idx].tolist()],
-                            [self.points[goal_idx].tolist()],
-                            [(1, 0, 0, 1)],
-                            [1],
-                        )
+        # debug visualization
+        # if self.cfg.viz_graph:
+        #     env_render_steps = 1000
+        #     if builtins.ISAAC_LAUNCHED_FROM_TERMINAL is False:
+        #         print(f"[INFO] Visualizing graph. Will do {env_render_steps} render steps...")
+        #     else:
+        #         print("[INFO] Visualizing graph.")
+            
+        #     # in headless mode, we cannot visualize the graph and omni.debug.draw is not available
+        #     try:
+        #         import omni.isaac.debug_draw._debug_draw as omni_debug_draw
 
-                if builtins.ISAAC_LAUNCHED_FROM_TERMINAL is False:
-                    sim = SimulationContext.instance()
-                    for _ in range(env_render_steps):
-                        sim.render()
+        #         draw_interface = omni_debug_draw.acquire_debug_draw_interface()
+        #         draw_interface.draw_points(
+        #             self.points.tolist(),
+        #             [(1.0, 0.5, 0, 1)] * self.cfg.sample_points,
+        #             [5] * self.cfg.sample_points,
+        #         )
+        #         for start_idx, goal_idx in zip(idx_edge_start, idx_edge_end):
+        #             draw_interface.draw_lines(
+        #                 [self.points[start_idx].tolist()],
+        #                 [self.points[goal_idx].tolist()],
+        #                 [(0, 1, 0, 1)],
+        #                 [1],
+        #             )
+        #         for start_idx, goal_idx in zip(idx_edge_start_filtered, idx_edge_end_filtered):
+        #             draw_interface.draw_lines(
+        #                 [self.points[start_idx].tolist()],
+        #                 [self.points[goal_idx].tolist()],
+        #                 [(1, 0, 0, 1)],
+        #                 [1],
+        #             )
+        #         if self.cfg.semantic_cost_mapping is not None:
+        #             for start_idx, goal_idx in zip(idx_edge_start_filtered_sem, idx_edge_end_filtered_sem):
+        #                 draw_interface.draw_lines(
+        #                     [self.points[start_idx].tolist()],
+        #                     [self.points[goal_idx].tolist()],
+        #                     [(1, 0, 0, 1)],
+        #                     [1],
+        #                 )
 
-                    # clear the drawn points and lines
-                    draw_interface.clear_points()
-                    draw_interface.clear_lines()
+        #         if builtins.ISAAC_LAUNCHED_FROM_TERMINAL is False:
+        #             sim = SimulationContext.instance()
+        #             for _ in range(env_render_steps):
+        #                 sim.render()
 
-                    print("[INFO] Finished visualizing graph.")
+        #             # clear the drawn points and lines
+        #             draw_interface.clear_points()
+        #             draw_interface.clear_lines()
 
-            except ImportError:
-                print("[WARNING] Graph Visualization is not available in headless mode.")
+        #             print("[INFO] Finished visualizing graph.")
+
+        #     except ImportError as e:
+        #         print(f"[ERROR] Import failed details: {e}")
+        #         print("[WARNING] Graph Visualization is not available in headless mode.")
 
     ###
     # Mesh dimensions
@@ -464,6 +531,29 @@ class TerrainAnalysis:
         ray_origins = ray_origins[without_wall].type(torch.float32)
         heights = heights[without_wall]
         return ray_origins, heights
+    
+    
+    # 加一个如果在室内就过滤掉该点，仅针对室外场景
+    def _point_filter_indoor(
+        self, ray_origins: torch.Tensor, heights: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        check_origins = ray_origins.clone()
+        check_origins[:, 2] = heights.squeeze() + self.cfg.robot_height
+        is_indoor = self.check_if_indoor(
+            ray_origins=check_origins,
+            max_dist=self.cfg.indoor_distance_threshold
+        )
+        num_filtered = is_indoor.sum().item()
+        if num_filtered > 0:
+            print(f"[DEBUG] filtered {num_filtered} indoor points based on raycast hits")
+        mask_outdoor = ~is_indoor
+        ray_origins = ray_origins[mask_outdoor].type(torch.float32)
+        if heights.ndim == 2:
+            heights = heights[mask_outdoor, :]
+        else:
+            heights = heights[mask_outdoor]
+        print(f"[DEBUG] Remaining points after indoor filter: {ray_origins.shape[0]}")
+        return ray_origins, heights
 
     def _point_filter_semantic_cost(
         self, ray_origins: torch.Tensor, heights: torch.Tensor
@@ -477,28 +567,60 @@ class TerrainAnalysis:
                 ray_starts=ray_origins.unsqueeze(0),
                 ray_directions=ray_directions.unsqueeze(0),
                 max_dist=self.cfg.wall_height * 2,
-                return_face_id=True,
+                return_face_id=True,  # <--- 关键点：请求返回击中面片的ID
                 **self._raycaster_mesh_param,
             )[3]
 
             # assign each hit the semantic class
+            # self._raycaster.face_id_category_mapping，巨大的查找表（Lookup Table）键 (Key)：Mesh 的路径字符串（例如 "/World/House/Mesh_0"）。
+            # 值 (Value)：一个巨大的 PyTorch 张量 (Tensor)。
+            # 这个张量的长度等于该 Mesh 中三角形面片（Face）的总数量。
+            # 这个张量的索引 (Index) 对应面片 ID（Face ID）。
+            # 这个张量的数值 (Value) 对应这个面片的原始语义类别 ID。
+            
+            # self._raycaster.cfg：传感器的配置对象。
+            # .mesh_prim_paths：一个列表，里面存了当前场景中所有被光线检测覆盖的 Mesh 的路径字符串。
+            # [0]：取出列表里的第一个路径。通常 Matterport 场景把整个房子合并成了一个巨大的 Mesh，所以列表里通常只有一个路径。
+            
+            # ray_face_ids：
+            # 这是上一行 raycast_mesh 函数的返回值。
+            # 假设我们发射了 3 条射线，分别击中了第 10、第 100、第 5 号面片。
+            # 它的形状可能是二维的 (1, 3)，内容是 [[10, 100, 5]]。
+            # .flatten() (展平)：
+            # PyTorch 的索引通常喜欢一维数组。
+            # 这个操作把二维的 [[10, 100, 5]] 变成了 一维的 [10, 100, 5]。
+            # .type(torch.long) (类型转换)：
+            # 非常重要。PyTorch 规定，做索引（Index）用的张量，数据类型必须是 64位整型 (LongTensor / int64)。
+            # 如果 ray_face_ids 原本是 32位整型 (int32) 或者浮点数 (float)，直接拿去查表会报错。这步操作就是强制转换类型，确保合规。
             class_id = self._raycaster.face_id_category_mapping[self._raycaster.cfg.mesh_prim_paths[0]][
                 ray_face_ids.flatten().type(torch.long)
             ]
             # map category index to reduced set
+            # Matterport3D 数据集的原始数据非常详细，里面的物体标签可能有成百上千种（例如：“扶手椅”、“办公椅”、“折叠椅”、“高脚凳”...）。
+            # 但在机器人导航任务中，我们通常不需要分得这么细，我们只关心它是不是**“椅子”**。
+            # 原始 ID (Raw ID)：可能是 102, 58, 99...（成百上千种）。
+            # 标准 ID (MpCat40)：这是 Matterport 定义的 40 种通用类别。比如 ID 5 代表所有类型的“椅子”。
             class_id = self._raycaster.mapping_mpcat40[class_id.type(torch.long) - 1]
-
-            # get class_id to cost mapping
+            # get class_id to cost mapping 初始化“最坏情况”成本表
             assert self.cfg.semantic_cost_mapping is not None, "Semantic cost mapping is not available"
-            class_id_to_cost = torch.ones(len(self._raycaster.classes_mpcat40), device=self.device) * max(
-                list(self.cfg.semantic_cost_mapping.to_dict().values())
-            )
-            for class_name, class_cost in self.cfg.semantic_cost_mapping.to_dict().items():
-                class_id_to_cost[self._raycaster.classes_mpcat40 == class_name] = class_cost
+            # class_id_to_cost = torch.ones(len(self._raycaster.classes_mpcat40), device=self.device) * max(
+            #     list(self.cfg.semantic_cost_mapping.to_dict().values())
+            # )
+            mapping = self.cfg.semantic_cost_mapping
+            max_cost = max(list(mapping.values()))
+            class_id_to_cost = torch.ones(len(self._raycaster.classes_mpcat40), device=self.device) * max_cost
+            
+            # 根据配置“降价”（更新成本）
+            # for class_name, class_cost in self.cfg.semantic_cost_mapping.to_dict().items():
+            #     class_id_to_cost[self._raycaster.classes_mpcat40 == class_name] = class_cost  # 布尔掩码（Mask）
+
+            for class_name, class_cost in mapping.items():
+                class_id_to_cost[self._raycaster.classes_mpcat40 == class_name] = class_cost 
 
             # get cost
             cost = class_id_to_cost[class_id.cpu()]
         else:
+            # 获取语义标签
             ray_classes = self._raycast_usd_stage(
                 ray_starts=ray_origins,
                 ray_directions=ray_directions,
@@ -508,10 +630,15 @@ class TerrainAnalysis:
 
             # get class to cost mapping
             assert self.cfg.semantic_cost_mapping is not None, "Semantic cost mapping is not available"
-            max_cost = max(list(self.cfg.semantic_cost_mapping.to_dict().values()))
+            # max_cost = max(list(self.cfg.semantic_cost_mapping.to_dict().values()))
+            mapping = self.cfg.semantic_cost_mapping
+            max_cost = max(list(mapping.values()))
             cost = torch.tensor(
                 [
-                    self.cfg.semantic_cost_mapping.to_dict()[ray_class] if ray_class is not None else max_cost
+                    # 循环查找每个击中点对应的语义类别的成本
+                    # self.cfg.semantic_cost_mapping.to_dict()[ray_class] if ray_class is not None else max_cost
+                    # for ray_class in ray_classes
+                    mapping.get(ray_class, max_cost) if ray_class is not None else max_cost
                     for ray_class in ray_classes
                 ],
                 device=self.device,
@@ -650,15 +777,21 @@ class TerrainAnalysis:
                 device=self.device,
             ),
         )
-        grid_z = torch.ones_like(grid_x, device=self.device) * max(
-            list(self.cfg.semantic_cost_mapping.to_dict().values())
-        )
+        
+        # grid_z = torch.ones_like(grid_x, device=self.device) * max( list(self.cfg.semantic_cost_mapping.to_dict().values()) )
+        
+        mapping = self.cfg.semantic_cost_mapping
+        max_cost = max(list(mapping.values()))
+        print(f"[DEBUG] Semantic cost mapping: {mapping}, max_cost: {max_cost}")    
+        grid_z = torch.ones_like(grid_x, device=self.device) * max_cost
+        # 分辨率决定的
         grid_points = torch.vstack((grid_x.flatten(), grid_y.flatten(), grid_z.flatten())).T
         direction = torch.zeros_like(grid_points, device=self.device)
         direction[:, 2] = -1.0
-
+        
         if isinstance(self._raycaster, MatterportRayCaster | MatterportRayCasterCamera):
             # check for collision with raycasting
+            print(f"[DEBUG] Semantic cost grid stats: raycasting")
             ray_face_ids = raycast_mesh(
                 ray_starts=grid_points.unsqueeze(0),
                 ray_directions=direction.unsqueeze(0),
@@ -676,32 +809,95 @@ class TerrainAnalysis:
 
             # get class_id to cost mapping
             assert self.cfg.semantic_cost_mapping is not None, "Semantic cost mapping is not available"
-            class_id_to_cost = torch.ones(len(self._raycaster.classes_mpcat40)) * max(
-                list(self.cfg.semantic_cost_mapping.to_dict().values())
-            )
-            for class_name, class_cost in self.cfg.semantic_cost_mapping.to_dict().items():
-                class_id_to_cost[self._raycaster.classes_mpcat40 == class_name] = class_cost
+            # class_id_to_cost = torch.ones(len(self._raycaster.classes_mpcat40)) * max(
+            #     list(self.cfg.semantic_cost_mapping.to_dict().values())
+            # )
+            class_id_to_cost = torch.ones(len(self._raycaster.classes_mpcat40), device=self.device) * max_cost
+            
+            # for class_name, class_cost in self.cfg.semantic_cost_mapping.to_dict().items():
+            #     class_id_to_cost[self._raycaster.classes_mpcat40 == class_name] = class_cost
+            
+            for class_name, class_cost in mapping.items():
+                class_id_to_cost[self._raycaster.classes_mpcat40 == class_name] = class_cost 
 
             cost = class_id_to_cost[class_id.cpu()]
         else:
-            ray_classes = self._raycast_usd_stage(
-                ray_starts=grid_points,
-                ray_directions=direction,
-                max_dist=self.cfg.wall_height * 2,
-                return_class=True,
-            )[3]
+            # print(f"[DEBUG] Semantic cost grid stats: USD raycasting")
+            # ray_classes = self._raycast_usd_stage(
+            #     ray_starts=grid_points,
+            #     ray_directions=direction,
+            #     max_dist=self.cfg.wall_height * 2,
+            #     return_class=True,
+            # )[3]
+            # print(f"[DEBUG] Semantic cost grid stats: ray_classes obtained")
+            # # get class to cost mapping
+            # assert self.cfg.semantic_cost_mapping is not None, "Semantic cost mapping is not available"
+            # # max_cost = max(list(self.cfg.semantic_cost_mapping.to_dict().values()))
+            
+            # # mapping = self.cfg.semantic_cost_mapping
+            # # max_cost = max(list(mapping.values()))
+            
+            # cost = torch.tensor(
+            #     [
+            #         # self.cfg.semantic_cost_mapping.to_dict()[ray_class] if ray_class is not None else max_cost
+            #         # for ray_class in ray_classes
+            #         mapping.get(ray_class, max_cost) if ray_class is not None else max_cost
+            #         for ray_class in ray_classes
+            #     ],
+            #     device=self.device,
+            # )
+            
+            # 配置通用的 Isaac Lab RayCaster 传感器。这会让代码在几何计算（高度图、墙壁碰撞）时使用 GPU 加速。对于语义计算，由于通用 USD 不支持 Warp 语义查询，它仍会走 CPU 分支（也就是我上一条回答建议的“分批处理”是必须的）。
+            
+            print(f"[DEBUG] Semantic cost grid stats: USD raycasting (Batch Processing)")
+            
+            # 定义批次大小，例如每次处理 10,000 个点
+            # 根据你的内存大小调整，10000-50000 通常是安全的
+            batch_size = 40000 
+            num_points = grid_points.shape[0]
+            all_ray_classes = []
+            
+            import math
+            num_batches = math.ceil(num_points / batch_size)
+            
+            for i in range(num_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, num_points)
+                
+                # 切片获取当前批次的数据
+                batch_starts = grid_points[start_idx:end_idx]
+                batch_dirs = direction[start_idx:end_idx]
+                
+                print(f"[DEBUG] Processing batch {i+1}/{num_batches} (Points: {len(batch_starts)})...")
+                
+                # 对当前批次进行射线检测
+                # 注意：这里我们不需要 distance 和 normal，只关心 class
+                batch_classes = self._raycast_usd_stage(
+                    ray_starts=batch_starts,
+                    ray_directions=batch_dirs,
+                    max_dist=self.cfg.wall_height * 2,
+                    return_class=True,
+                )[3]
+                
+                all_ray_classes.extend(batch_classes)
+                
+            ray_classes = all_ray_classes
+            print(f"[DEBUG] Semantic cost grid stats: ray_classes obtained ({len(ray_classes)} total)")
 
             # get class to cost mapping
             assert self.cfg.semantic_cost_mapping is not None, "Semantic cost mapping is not available"
-            max_cost = max(list(self.cfg.semantic_cost_mapping.to_dict().values()))
+            
+            mapping = self.cfg.semantic_cost_mapping
+            max_cost = max(list(mapping.values()))
+            
             cost = torch.tensor(
                 [
-                    self.cfg.semantic_cost_mapping.to_dict()[ray_class] if ray_class is not None else max_cost
+                    mapping.get(ray_class, max_cost) if ray_class is not None else max_cost
                     for ray_class in ray_classes
                 ],
                 device=self.device,
             )
-
+        print(f"[DEBUG] Semantic cost grid stats: get")
         # get cost grid
         cost_grid = (
             cost.reshape(
@@ -737,7 +933,7 @@ class TerrainAnalysis:
             .cpu()
             .numpy()
         )
-
+        print(f"[DEBUG] Semantic cost grid stats: prepared indices")
         filter_idx = np.zeros(check_grid_idx_start.shape[0], dtype=bool)
 
         for idx, (edge_start_idx, edge_end_idx) in enumerate(zip(check_grid_idx_start, check_grid_idx_end)):
@@ -755,9 +951,22 @@ class TerrainAnalysis:
 
         return idx_edge_start, idx_edge_end, distance, idx_edge_start_filtered, idx_edge_end_filtered
 
+    # 构建环境的几何表示：为了能让光线“看见”虚拟世界，必须把 USD 场景中的几何体（Mesh）提取出来。
+    # 双重构建策略：
+    # 通用 Mesh (self._warp_mesh)：包含所有物体（地面、墙、桌子），用于物理射线检测（Raycasting），计算地形高度和碰撞。
+    # 障碍物 Mesh (self._warp_mesh_obstacles)：专门把“非地面”的物体提取出来，构建一个独立的网格。这通常用于更高级的语义可通行性检查（例如：光线打到了东西，如果是打到 _warp_mesh_obstacles，那就坚决不能走）。
     def _setup_raycaster(self):
+        # [优化] 缓存检查：如果已经构建过 Warp Mesh，直接返回，避免重复计算
+        if hasattr(self, "_warp_mesh") and self._warp_mesh is not None:
+            # 同时也检查一下障碍物 mesh 是否存在
+            if hasattr(self, "_warp_mesh_obstacles") and self._warp_mesh_obstacles is not None:
+                # 已经初始化过了，无需重复操作
+                return
+        
         # get the raycaster sensor that should be used to raycast against all the ground meshes
+        # 尝试使用现成的 Raycaster 传感器
         sensor_key = self.cfg.raycaster_sensor
+        # 检查配置里是否指定了 Raycaster，以及场景里是否真的有这个传感器
         use_sensor = (
             sensor_key is not None
             and hasattr(self.scene, "sensors")
@@ -769,29 +978,35 @@ class TerrainAnalysis:
         )
 
         if use_sensor:
+            # 动作：从 self.scene.sensors 字典中，根据配置的 sensor_key（例如 "main_lidar" 或 "terrain_scanner"）取出对应的传感器对象。
+            # 赋值：将其赋值给 self._raycaster。
+            # 类型注解：中间那一长串 MatterportRayCaster | ... 是 Python 的类型提示，告诉阅读者和 IDE，这个变量可能是这四种传感器类型中的任意一种。这说明代码设计时考虑了兼容不同的传感器实现。
             self._raycaster: MatterportRayCaster | MatterportRayCasterCamera | RayCaster | RayCasterCamera = (
                 self.scene.sensors[sensor_key]
             )
-
+            # 兼容性检查
             if isinstance(self._raycaster.meshes[self._raycaster.cfg.mesh_prim_paths[0]], list):
                 # for new RSL implementation of raycaster
                 # FIXME: @pascal-roth: this is a temporary fix until the new raycaster is merged into the public main branch
+                # 注释：明确指出这是一个 FIXME（待修复的临时补丁）。说明新版 Raycaster 还没合并到公共主分支，所以API有些不同。
                 self._raycaster_mesh_param = {"mesh_id": self._raycaster._mesh_ids_wp.numpy()[0][0]}
             else:
                 self._raycaster_mesh_param = {"mesh": self._raycaster.meshes[self._raycaster.cfg.mesh_prim_paths[0]]}
 
-            # get mesh dimensions [x_max, y_max, x_min, y_min]
+            # get mesh dimensions [x_max, y_max, x_min, y_min] 获取网格尺寸
             self._mesh_dimensions = self._get_mesh_dimensions()
         else:
             # raycaster is not available in multi-mesh scenes (i.e. unreal meshes) as it only works with a single mesh
             # TODO (@pascal-roth) change when raycaster can handle multiple meshes
             self._raycaster = None
 
-            # get mesh dimensions [x_max, y_max, x_min, y_min]
+            # get mesh dimensions [x_max, y_max, x_min, y_min] # 1. 计算场景边界
             self._mesh_dimensions = self._get_usd_stage_dimensions()
 
+            # 这段代码的主要目的是：当场景中没有现成的 RayCaster 传感器时，手动从 USD 场景中提取几何信息，构建一个“Warp Mesh”对象，以便利用 GPU 加速进行地形分析。
             # Build a combined Warp mesh from USD stage to enable geometry raycasts without PhysX colliders
             try:
+                # # 获取场景中所有的 Mesh Prim（图元）
                 all_mesh_prims, all_mesh_names = get_all_meshes(self.scene.terrain.cfg.prim_path)
                 # Filter per limiter (exclude groundplane unless used as fallback)
                 if self.cfg.dim_limiter_prim:
@@ -806,8 +1021,10 @@ class TerrainAnalysis:
                     gp_idx = [idx for idx, name in enumerate(all_mesh_names) if "groundplane" in name.lower()]
                     mesh_prims = [all_mesh_prims[i] for i in gp_idx]
 
+                # 初始化 USD 几何工具
                 from pxr import UsdGeom, Usd
-                xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+                xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default()) # 用于计算世界坐标变换
+                # 准备列表存储顶点和面
                 verts_all: list[np.ndarray] = []
                 faces_all: list[np.ndarray] = []
                 v_offset = 0
@@ -880,11 +1097,15 @@ class TerrainAnalysis:
             try:
                 all_mesh_prims, all_mesh_names = get_all_meshes(self.scene.terrain.cfg.prim_path)
                 
-                # 从 keyword_map 中获取 floor 关键词（可通行区域）
+                # 从 keyword_map 中获取 floor 关键词（可通行区域）# road sidewalk crosswalk floor
                 # 所有不匹配 floor 关键词的 mesh 都将被视为障碍物
                 floor_keywords = []
-                if 'floor' in self._keyword_map:
-                    floor_keywords = [kw.lower() for kw in self._keyword_map['floor']]
+                # 支持多个可通行类别（如 road, sidewalk, crosswalk, floor）
+                traversable_classes = ["road", "sidewalk", "crosswalk", "floor"]
+                floor_keywords = []
+                for cls in traversable_classes:
+                    if cls in self._keyword_map:
+                        floor_keywords.extend([kw.lower() for kw in self._keyword_map[cls]])
                 
                 # 收集障碍物mesh（所有非floor的mesh）
                 obstacle_verts: list[np.ndarray] = []
@@ -1122,7 +1343,6 @@ class TerrainAnalysis:
                 print(f"[INFO] Visualizing height map. Will do {env_render_steps} render steps...")
             else:
                 print("[INFO] Visualizing height map.")
-
             # in headless mode, we cannot visualize the graph and omni.debug.draw is not available
             try:
                 import omni.isaac.debug_draw._debug_draw as omni_debug_draw
@@ -1159,12 +1379,82 @@ class TerrainAnalysis:
 
                     print("[INFO] Finished visualizing height map.")
 
-            except ImportError:
+            except ImportError as e:
+                print(f"[ERROR] Import failed details: {e}")
                 print("[WARNING] Height Map Visualization is not available in headless mode.")
+
+    def check_if_indoor(self, ray_origins: torch.Tensor, max_dist: float) -> torch.Tensor:
+        """
+        判断点是否在室内（即周围大部分方向都被障碍物包围）。
+        返回: Bool Tensor (True=室内, False=室外)
+        """
+        device = ray_origins.device
+        num_points = ray_origins.shape[0]
+        
+        if num_points == 0:
+            return torch.zeros(0, dtype=torch.bool, device=device)
+        
+        # 1. 生成射线方向 (20个方向，360度覆盖)
+        # endpoint=False 避免 -pi 和 pi 重复
+        angles = np.linspace(-np.pi, np.pi, 20, endpoint=False)
+        
+        # 计算方向向量 (20, 3)
+        ray_directions_np = tf.Rotation.from_euler("z", angles, degrees=False).as_matrix() @ np.array([1, 0, 0])
+        
+        hits_list = []
+
+        # 2. 循环执行 Raycast
+        for ray_dir in ray_directions_np:
+            # 扩展方向向量: (N, 3)
+            ray_direction_torch = (
+                torch.from_numpy(ray_dir)
+                .type(torch.float32)
+                .to(device)
+                .unsqueeze(0)
+                .repeat(num_points, 1)
+            )
+
+            # 执行 Raycast
+            if self._raycaster is not None:
+                # 使用 Warp Mesh 加速
+                result = raycast_mesh(
+                    ray_starts=ray_origins.unsqueeze(0),
+                    ray_directions=ray_direction_torch.unsqueeze(0),
+                    max_dist=max_dist,
+                    return_distance=True,
+                    **self._raycaster_mesh_param,
+                )
+                distance = result[1].squeeze(0)
+            else:
+                # 使用 USD Stage (较慢)
+                result = self._raycast_usd_stage(
+                    ray_starts=ray_origins,
+                    ray_directions=ray_direction_torch,
+                    max_dist=max_dist,
+                    return_distance=True,
+                )
+                distance = result[1]
+
+            # 3. 判定击中
+            # 击中 = (距离不是无穷大) AND (距离小于设定阈值)
+            has_hit = (~torch.isinf(distance)) & (distance < max_dist)
+            hits_list.append(has_hit)
+
+        # 4. 判定室内
+        if not hits_list:
+            return torch.zeros(num_points, dtype=torch.bool, device=device)
+        # shape: [num_directions, num_points]
+        all_hits = torch.stack(hits_list, dim=0)
+        # 计算包围比例
+        hit_ratio = torch.mean(all_hits.float(), dim=0)
+        # 如果超过 90% 的方向都被挡住，认为是室内
+        is_indoor = hit_ratio > 0.9
+        return is_indoor
+
 
     ###
     # Helper function when isaaclab raycaster is not available
-    ###
+    ### 
 
     def _raycast_usd_stage(
         self,

@@ -28,6 +28,7 @@ from omni.viplanner.plannernet import (
     AutoEncoder,  # 基础编码器-解码器模型（可能用于深度图输入）
     DualAutoEncoder,  # 双输入编码器-解码器模型（可能用于深度+语义/RGB输入）
     get_m2f_cfg,  # 获取Mask2Former配置的函数
+    HybridCNNTransformer,  # 混合CNN-Transformer模型类
 )
 from omni.viplanner.traj_cost_opt import TrajCost, TrajViz  # 轨迹成本计算和轨迹可视化类
 from omni.viplanner.utils.torchutil import EarlyStopScheduler, count_parameters  # 早期停止调度器和参数计数工具
@@ -56,7 +57,6 @@ class Trainer:
         # image transforms
         self.transform = transforms.Compose(  # 定义图像预处理管道，之后输出的图像都这个来处理
             [
-                # ToTensor() 操作会自动将数据除以 255（如果是 uint8 类型）或者直接保留（如果是 float）
                 transforms.ToTensor(),  # 将PIL图像或numpy数组转换为PyTorch张量
                 transforms.Resize((self._cfg.img_input_size), antialias=True),  # 调整图像大小到指定输入尺寸
             ]
@@ -75,7 +75,7 @@ class Trainer:
         # inti buffers MODEL (模型相关缓冲区)
         self.best_loss = float("inf")  # 记录最佳验证损失，初始化为无穷大
         self.test_loss = float("inf")  # 记录测试损失，初始化为无穷大
-        self.net: nn.Module = None  # 神经网络模型实例 _load_model中进行初始化
+        self.net: nn.Module = None  # 神经网络模型实例
         self.optimizer: optim.Optimizer = None  # 优化器实例
         self.scheduler: EarlyStopScheduler = None  # 早期停止调度器实例
 
@@ -299,42 +299,18 @@ class Trainer:
         return
 
     def _load_model(self, resume: bool = False) -> None:
-        if self._cfg.sem or self._cfg.rgb:  # 如果使用语义或RGB输入
-            if self._cfg.rgb and self._cfg.pre_train_sem:  # 如果使用RGB并且需要预训练语义模型
-                assert PRE_TRAIN_POSSIBLE, (  # 检查是否可以使用预训练模型
-                    "Pretrained model not available since either detectron2"
-                    " not installed or mask2former not found in thrid_party"
-                    " folder"
-                )
-                pre_train_cfg = os.path.join(self._cfg.all_model_dir, self._cfg.pre_train_cfg)  # 预训练配置文件路径
-                pre_train_weights = (
-                    os.path.join(self._cfg.all_model_dir, self._cfg.pre_train_weights)
-                    if self._cfg.pre_train_weights
-                    else None
-                )  # 预训练权重路径，如果未指定则为None
-                m2f_cfg = get_m2f_cfg(pre_train_cfg)  # 获取Mask2Former配置
-                self.pixel_mean = m2f_cfg.MODEL.PIXEL_MEAN  # 获取像素均值
-                self.pixel_std = m2f_cfg.MODEL.PIXEL_STD  # 获取像素标准差
-            else:
-                m2f_cfg = None
-                pre_train_weights = None
-
-            self.net = DualAutoEncoder(self._cfg, m2f_cfg=m2f_cfg, weight_path=pre_train_weights)  # 创建双输入编码器-解码器模型实例
-        else:  # 如果只使用深度图输入
-            self.net = AutoEncoder(self._cfg.in_channel, self._cfg.knodes)  # 创建单输入编码器-解码器模型实例
-
+        self.net = HybridCNNTransformer(self._cfg)  # 创建模型实例
         assert torch.cuda.is_available(), "Code requires GPU"  # 确保CUDA可用
         print(f"Available GPU list: {list(range(torch.cuda.device_count()))}")
         print(f"Running on GPU: {self._cfg.gpu_id}")
         self.net = self.net.cuda(self._cfg.gpu_id)  # 将模型移动到指定GPU
         print(f"[INFO] MODEL LOADED ({count_parameters(self.net)} parameters)")
 
-        if resume:  # 如果需要从检查点恢复
-            model_state_dict, self.best_loss = torch.load(self.model_path)  # 加载模型状态字典和最佳损失
-            self.net.load_state_dict(model_state_dict)  # 将状态字典加载到模型中
-            print(f"Resume train from {self.model_path} with loss " f"{self.best_loss}")
-
-        return
+        # if resume:  # 如果需要从检查点恢复
+        #     model_state_dict, self.best_loss = torch.load(self.model_path)  # 加载模型状态字典和最佳损失
+        #     self.net.load_state_dict(model_state_dict)  # 将状态字典加载到模型中
+        #     print(f"Resume train from {self.model_path} with loss " f"{self.best_loss}")
+        # return
 
     def _configure_optimizer(self) -> None:
         if self._cfg.optimizer == "adam":  # 如果使用Adam优化器
@@ -469,25 +445,6 @@ class Trainer:
             if self._cfg.sem or self._cfg.rgb:  # 如果使用语义或RGB输入
                 depth_image = inputs[0].cuda(self._cfg.gpu_id)  # 深度图像数据
                 sem_rgb_image = inputs[1].cuda(self._cfg.gpu_id)  # 语义或RGB图像数据
-                # 当你写 preds, fear = self.net(image, goal) 时，它最终会去执行你在模型类里定义的 def forward(self, ...): 下面的代码。
-                # 在 Python 中，当你像调用函数一样“调用”一个对象（在对象后面加括号 ()）时，Python 会自动去寻找这个对象内部的一个特殊方法：__call__。
-                # PyTorch 的所有网络层（包括你自己写的 PlannerNet）都继承自 nn.Module。nn.Module 帮你写好了 __call__ 方法，它的逻辑大概是这样的（伪代码）：
-                # # PyTorch 内部的逻辑（简化版）
-                # class Module:
-                #     def __call__(self, *input, **kwargs):
-                #         # 1. 做一些准备工作（比如处理 Hooks，记录操作图等）
-                #         # ...
-                #         # 2. 【关键】调用你写的 forward 函数
-                #         result = self.forward(*input, **kwargs)
-                #         # 3. 做一些收尾工作
-                #         # ...
-                #         return result
-                # 既然最终都是运行 forward，为什么不直接写 self.net.forward(image, goal) 呢？
-                # 如果不通过 self.net() 这个入口，而是直接走后门去调 forward，你会跳过 PyTorch 帮你做的很多“幕后工作”，也就是上面伪代码里的第 1 步和第 3 步。
-                # 这些幕后工作包括：
-                # Hooks (挂钩)： 如果你在网络里挂了一些钩子（比如用来提取中间层特征，或者监控梯度），直接调 forward 钩子就不生效了。
-                # Just-In-Time (JIT) 编译： 影响模型导出。
-                # Amp (自动混合精度)： 可能会影响半精度训练的处理。
                 preds, fear = self.net(depth_image, sem_rgb_image, goal)  # 前向传播
             else:  # 仅使用深度图输入
                 image = inputs[0].cuda(self._cfg.gpu_id)  # 深度图像数据
@@ -613,6 +570,47 @@ class Trainer:
                 self.data_traj_viz[env_id].VizImages(preds_viz, wp_viz, odom_viz, goal_viz, fear_viz, image_viz)  # 调用图像可视化工具
         return test_loss / (batch_idx + 1)  # 返回平均测试损失
 
+    @staticmethod
+    def compute_masked_loss(pred_path, gt_path, mask):
+        """
+        计算带掩码的 MSE Loss
+        pred_path: [B, K, 3]
+        gt_path:   [B, K, 3] (由 TrajGenerator 生成的 '真实' 轨迹点，或者实际的 GT)
+        mask:      [B, K]    (True 为无效点)
+        """
+        # 1. 计算均方误差
+        raw_loss = (pred_path - gt_path) ** 2
+        
+        # 2. 应用掩码 (将无效点的 loss 置 0)
+        # mask 需要扩展维度以匹配 [B, K, 3]
+        if mask is not None:
+            mask_expanded = mask.unsqueeze(-1).expand_as(raw_loss)
+            raw_loss = raw_loss.masked_fill(mask_expanded, 0.0)
+            
+            # 3. 计算平均值 (分母为有效元素个数)
+            num_valid = (~mask).sum() * 3
+            return raw_loss.sum() / (num_valid + 1e-6)
+        else:
+            return raw_loss.mean()
+        
+    # 在 Trainer 类中 只计算有效节点的loss适应路径长度和角度变化量的区别
+    def _loss(self, preds, mask, traj_cost, odom, goal, ...):
+        # preds: [B, K, 2] 或 [B, K, 3]
+        # mask: [B, K] (True 表示是 padding，无效点)
+        
+        # 1. 生成实际轨迹点 (只取 mask 为 False 的部分)
+        # 注意：这里不能简单 reshape，因为每个 batch 的有效长度不一样
+        # 通常做法是将无效点的 loss 乘以 0
+        
+        loss_all = traj_cost.CostofTraj(preds, ...) # 计算所有点的 loss
+        
+        # 2. 应用 mask 过滤 loss
+        # logical_not: True 变为 False (无效)，False 变为 True (有效)
+        valid_mask = ~mask 
+        loss_valid = loss_all * valid_mask.float().unsqueeze(-1)
+        
+        return loss_valid.sum() / valid_mask.sum(), preds
+
     def _loss(
         self,
         preds: torch.Tensor,  # 预测的路径点张量
@@ -624,7 +622,7 @@ class Trainer:
         step: float = 0.1,      # 分层训练的当前步长（用于调整轨迹生成）
         dataset: str = "train",     # 数据集类型（训练或验证）
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 将预测的路径点转换为实际轨迹点，有网络输出量量转化为实际参与评价的轨迹点。跟起止点的速度无关
+        # 将预测的路径点转换为实际轨迹点，有网络输出量量转化为实际参与评价的轨迹点
         waypoints = traj_cost.opt.TrajGeneratorFromPFreeRot(preds, step=step)  # 生成轨迹点
         loss = traj_cost.CostofTraj(  # 计算轨迹代价作为损失
             waypoints,

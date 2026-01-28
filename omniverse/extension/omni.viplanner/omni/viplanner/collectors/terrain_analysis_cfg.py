@@ -18,18 +18,28 @@ class TerrainAnalysisCfg:
     - 生效: 是（在 TerrainAnalysis._point_filter_wall_closeness / _sample_points 中用于设置采样点 z）
     """
 
-    wall_height: float = 1.0
+    wall_height: float = 1.4  # 对应室外场景
+    # wall_height: float = 1.0  # 对应室内场景
+    
     """Height of the walls.
 
     Wall filtering will start rays from that height and filter all that hit the mesh within 0.3m."""
     # 生效: 是（构建高度图与墙体/外侧过滤、门洞检测等垂直射线起点高度）
 
-    robot_buffer_spawn: float = 0.7
+    robot_buffer_spawn: float = 0.5
     """Robot buffer for spawn location
 
     采样点与墙/障碍最小安全距离（水平多方向射线检查）。
     - 生效: 是（_point_filter_wall_closeness）
     """
+
+    indoor_distance_threshold: float = 10.0
+    """Threshold distance to consider a point as indoor
+    If the distance to the nearest wall is less than this threshold, the point is considered indoor.
+    - 生效: 是（_point_filter_indoor）
+    """
+
+    filter_indoor: bool = True
 
     sample_points: int = 1000
     """Number of nodes in the tree
@@ -87,7 +97,8 @@ class TerrainAnalysisCfg:
     - 生效: 是（_setup_raycaster 选择使用 RayCaster 还是 USD 全场景 PhysX 射线）
     """
 
-    grid_resolution: float = 0.1
+    # 如果场景小可以使用更高的分辨率
+    grid_resolution: float = 0.5
     """Resolution of the grid to check for not traversable edges
 
     高度图与代价网格的分辨率（米）。
@@ -113,7 +124,28 @@ class TerrainAnalysisCfg:
     - 生效: 是（高度图构建后的调试可视化）
     """
 
-    semantic_cost_mapping: object | None = None
+    # semantic_cost_mapping: object | None = None
+    semantic_cost_mapping: dict[str, float] | None = {
+        "road": 0.3,   # 道路，代价 1.5
+        "sidewalk": 0.0, 
+        "crosswalk": 0.0,
+        "floor": 0.0,
+        "vehicle": 2.0,
+        "building": 2.0,
+        "wall": 2.0,    # 语义标签为 "wall" 的物体，代价为 1.0
+        "fence": 2.0,
+        "pole": 2.0,
+        "traffic_sign": 2.0,
+        "traffic_light": 2.0,
+        "bench": 2.0,
+        "vegetation": 1.0,
+        "terrain": 1.0,
+        "water_surface": 2.0,
+        "sky": 2.0,
+        "dynamic": 2.0,
+        "static": 2.0,
+        "furniture": 1.0,
+    }
     """Mapping of semantic categories to costs for filtering edges and nodes
 
     语义类别到代价的映射（越高越不可取）。
