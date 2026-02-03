@@ -2,7 +2,7 @@
 Author: lichao951787328 951787328@qq.com
 Date: 2026-01-28 16:54:44
 LastEditors: lichao951787328 951787328@qq.com
-LastEditTime: 2026-01-28 17:09:57
+LastEditTime: 2026-01-28 17:23:00
 FilePath: /viplanner/viplanner/utils/cubic_curve.py
 Description: 三次Hermite样条可视化，包含自定义速度开关与原地转弯演示
 '''

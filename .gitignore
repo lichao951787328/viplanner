@@ -1,6 +1,7 @@
 # model files
 ros/planner/models/*
 rotated_out/
+viplanner_debug/
 #internal files
 */intern/*
 # beat the planner files

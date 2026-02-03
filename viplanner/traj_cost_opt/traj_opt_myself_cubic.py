@@ -35,7 +35,9 @@ class CubicSplineTorch:
             device=t.device,
         )
         return A @ tt
-
+    # 注意这里并没有严格的考虑机器人的真实物理速度，只是假设机器人在控制点之间的运动是平滑连续的。
+    # 这种假设在很多路径规划场景下是合理的，尤其是当控制点足够密集时。
+    # 但是不符合轮式差速地盘和人形，人形机器人对稳定性要求很高，如果速度不连续会导致跌倒。
     def interp(self, x, y, xs):
         # x: 原始点的索引（如 0, 1, 2...）
         # y: 原始路径点坐标 (Batch, Points, Dims)
@@ -63,16 +65,15 @@ class CubicSplineTorch:
         out = out + hh[:, :, 2:3] * y[:, idxs + 1, :]
         out = out + hh[:, :, 3:4] * m[:, idxs + 1] * dx[:, :, None]
         return out
-
-
+    
+    
 class TrajOpt:
     debug = False
 
     def __init__(self):
         self.cs_interp = CubicSplineTorch()
 
-    # 从预测点生成轨迹
-    def TrajGeneratorFromPFreeRot(self, preds, step):
+    def TrajGeneratorFromPFreeRotVI(self, preds, step):
         # Points is in se3
         # preds: 预测的关键点，形状通常为 [Batch, Num_Points, Dims]
         # step: 插值的步长（决定了输出轨迹的密度）
@@ -97,21 +98,14 @@ class TrajOpt:
         num_p = num_p + 1
         # 2. 构造时间/索引向量
         # xs: 目标插值点索引（例如 0.0, 0.1, 0.2 ... num_p-1）
-        # torch.arange(start, end, step) 生成一个从 start 开始，以 step 为步长，直到（但不包括）end 的一维张量。
-        # $$[start, start+step, start+2*step, ..., < end]$$
-        # 在代码 xs = torch.arange(0, num_p - 1 + step, step, device=preds.device) 中：
-        # start = 0： 序列从 0 开始。在样条插值中，整数索引（0, 1, 2...）通常对应实际的控制点（Control Points）。
-        # end = num_p - 1 + step： 这是为了确保序列包含最后一个控制点的索引 num_p - 1。
-        # num_p 是控制点的总数（包括了前面手动添加的原点）。
-        # num_p - 1 是最后一个控制点的索引（因为索引从0开始）。
-        # 因为 torch.arange 是“左闭右开”区间 [start, end)，如果不加 step，序列可能刚好在 num_p - 1 之前停止。加上 step 后，上限变成了 num_p - 1 + step，保证了 num_p - 1 肯定会被包含在序列里。
-        # step = step： 步长。比如 0.1。这意味着在每两个整数索引之间（比如 0 和 1 之间），会生成 0.1, 0.2 ... 0.9 这些小数索引。
         xs = torch.arange(0, num_p - 1 + step, step, device=preds.device)
         xs = xs.repeat(batch_size, 1)
         # x: 原始控制点索引（例如 0, 1, 2 ... num_p）
         x = torch.arange(num_p, device=preds.device, dtype=preds.dtype)
         x = x.repeat(batch_size, 1)
         waypoints = self.cs_interp.interp(x, points_preds, xs)
+
+        # print(f"[DEBUG] Generated waypoints shape: {waypoints.shape}")
 
         if self.debug:
             import matplotlib.pyplot as plt  # for plotting
@@ -131,7 +125,17 @@ class TrajOpt:
             plt.legend()
             plt.show()
 
-        return waypoints  # R3
+        return waypoints
+
+    # 从预测点生成轨迹
+    def TrajGeneratorFromPFreeRot(self, preds, step, mask=None):
+        if mask is not None:
+            valid_len = (~mask).sum(dim=1).long()
+            max_valid = int(torch.clamp(valid_len.max(), min=2).item())
+            preds = preds[:, :max_valid, :]
+            mask = mask[:, :max_valid]
+            # print(f"[DEBUG] TrajGeneratorFromPFreeRot max_valid: {max_valid}")
+        return self.TrajGeneratorFromPFreeRotVI(preds, step)
 
     # 简单的双线性插值
     # 这是一个备选方案，比三次样条更简单、计算更快，但平滑度较差（一阶导数不连续，生成的轨迹是折线）。
@@ -165,3 +169,4 @@ class TrajOpt:
             plt.show()
 
         return waypoints
+

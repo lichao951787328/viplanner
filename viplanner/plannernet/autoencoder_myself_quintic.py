@@ -29,7 +29,7 @@ class AutoEncoderGrid(nn.Module):
             step_size=step_size
         )
 
-    def forward(self, x: torch.Tensor, goal: torch.Tensor):
+    def forward(self, x: torch.Tensor, odom: torch.Tensor, goal: torch.Tensor):
         # x: [Batch, 1, 80, 80]
         # goal: [Batch, 3]
         
@@ -38,7 +38,7 @@ class AutoEncoderGrid(nn.Module):
         
         # Decoder 推理
         # 返回三个值: path, cost, mask
-        x, c, mask = self.decoder(x, goal)
+        x, c, mask = self.decoder(x, odom, goal)
         
         return x, c, mask
 
@@ -46,7 +46,7 @@ class DecoderGridDynamic(nn.Module):
     def __init__(self, in_channels, goal_channels, 
                  input_feature_size=10, 
                  max_dist=10.0, 
-                 step_size=0.5):
+                 step_size=0.25):
         super().__init__()
         
         self.step_size = step_size
@@ -56,9 +56,8 @@ class DecoderGridDynamic(nn.Module):
         # 例如 10.0 / 0.5 = 20 个点
         self.max_k = int(math.ceil(max_dist / step_size))
         print(f"[INFO] 动态 Decoder 初始化: Max Dist={max_dist}m, Step={step_size}m, Max K={self.max_k}")
-
         self.relu = nn.ReLU(inplace=True)
-        self.fg = nn.Linear(3, goal_channels)
+        self.state_embedding = nn.Linear(12, goal_channels)
         self.sigmoid = nn.Sigmoid()
 
         # === 卷积层 ===
@@ -74,7 +73,7 @@ class DecoderGridDynamic(nn.Module):
         self.fc2 = nn.Linear(1024, 512)
         
         # 输出层：输出固定数量的点 (max_k)
-        self.fc3 = nn.Linear(512, self.max_k * 3)
+        self.fc3 = nn.Linear(512, self.max_k * 4)
 
         # Cost 分支
         self.frc1 = nn.Linear(1024, 128)
@@ -86,14 +85,18 @@ class DecoderGridDynamic(nn.Module):
             x = self.conv2(self.conv1(dummy))
             return x.view(1, -1).size(1)
 
-    def forward(self, x, goal):
+    def forward(self, x, odom, goal):
         # --- 1. 常规网络前向传播 ---
         # 目标编码
-        goal_encoded = self.fg(goal[:, 0:3])
-        goal_map = goal_encoded[:, :, None, None].expand(-1, -1, x.shape[2], x.shape[3])
+        state_input = torch.cat([odom, goal], dim=1) # [B, 12]
+        state_encoded = self.state_embedding(state_input) # [B, goal_channels]
+        H, W = x.shape[2], x.shape[3]
+        state_map = state_encoded[:, :, None, None].expand(-1, -1, H, W)
+        # goal_encoded = self.fg(goal[:, 0:3])
+        # goal_map = goal_encoded[:, :, None, None].expand(-1, -1, x.shape[2], x.shape[3])
         
         # 拼接 + 卷积
-        x = torch.cat((x, goal_map), dim=1)
+        x = torch.cat((x, state_map), dim=1)
         x = self.relu(self.conv1(x))
         x = self.relu(self.conv2(x))
         x = torch.flatten(x, 1)
@@ -103,7 +106,7 @@ class DecoderGridDynamic(nn.Module):
         
         # 预测路径 (全量预测)
         out_path = self.fc3(self.relu(self.fc2(f)))
-        out_path = out_path.reshape(-1, self.max_k, 3)
+        out_path = out_path.reshape(-1, self.max_k, 4)
         
         # 预测成本
         c = self.sigmoid(self.frc2(self.relu(self.frc1(f))))
@@ -113,7 +116,7 @@ class DecoderGridDynamic(nn.Module):
         dist_to_goal = torch.norm(goal[:, :2], p=2, dim=1) # [Batch]
         
         # 计算实际需要的点数 (向上取整)
-        num_valid_points = torch.ceil(dist_to_goal / self.step_size).long().clamp(min=1, max=self.max_k)
+        num_valid_points = torch.ceil((dist_to_goal / self.step_size) * 1.25).long().clamp(min=1, max=self.max_k)
         
         # 生成掩码 [Batch, max_k]
         # True = 无效点 (Padding)

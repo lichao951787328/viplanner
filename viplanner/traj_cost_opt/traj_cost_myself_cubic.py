@@ -25,7 +25,7 @@ torch.set_default_dtype(torch.float32)
 from cost_maps import OccupancyCostMap  # 处理点云地图或栅格地图的类
 
 # visual-imperative-planning
-from traj_cost_opt.traj_opt_myself import TrajOpt
+from traj_cost_opt.traj_opt_myself_cubic import TrajOpt
 
 try:
     import pypose as pp  # only used for training 用于处理机器人位姿变换（SE3）
@@ -217,158 +217,218 @@ class TrajCost:
         )
         self.is_map = True
         
-        # 验证物理坐标到像素坐标的转换
-        # import matplotlib.pyplot as plt
-
-        # # 假设有一个物理坐标点
-        # phys_point = torch.tensor([[2.0, 3.0, 0.0]], device=device)  # 物理坐标 (x=2.0, y=3.0)
-        # phys_point = phys_point.unsqueeze(0)  # [1, 1, 3]  batch=1, num_points=1
-
-        # # 转换为像素坐标
-        # pixel_idx = self.cost_map.Pos2Ind(phys_point)  # [1, 1, 2]
-        # print(f"[DEBUG] Physical Point: {phys_point[0,0,:].cpu().numpy()}, Pixel Index: {pixel_idx[0,0,:].cpu().numpy()}")
-        # pixel_idx_np = pixel_idx[0, 0].cpu().numpy()
-        # print(f"[DEBUG] Transformed Pixel Index: Row={pixel_idx_np[0]:.2f}, Col={pixel_idx_np[1]:.2f}")
-
-        # # 显示地图和点
-        # plt.figure()
-        # plt.imshow(self.cost_map.cost_array.cpu().numpy(), cmap='viridis')
-        # plt.scatter([pixel_idx_np[1]], [pixel_idx_np[0]], c='red', marker='x', s=100, label='Transformed Point')
-        # plt.title(f"Physical ({phys_point[0,0,0].item():.2f},{phys_point[0,0,1].item():.2f}) -> Pixel ({pixel_idx_np[0]:.1f},{pixel_idx_np[1]:.1f})")
-        # plt.legend()
-        # plt.show()
     
-    def _compute_motion_loss(self, waypoints, mask=None):
+    def _compute_goal_loss(self, waypoints, goal, mask=None):
         """
-        严谨考虑 Mask 的动力学 Loss 计算。
+        计算全状态终点代价 (Position + Velocity + Heading)
         
         Args:
-            waypoints: [Batch, N, 2]
-            mask: [Batch, N] (True 表示无效/Padding, False 表示有效)
+            waypoints: [B, N, 2] -> (x, y)
+            goal: [B, 2] -> (gx, gy)
+            mask: [B, N] (True = 无效/Padding)
         """
+        # 添加断言，确保输入维度正确
+        assert waypoints.shape[-1] == 2, f"waypoints last dim must be == 2, got {waypoints.shape[-1]}"
+        assert goal.shape[-1] == 2, f"goal last dim must be == 2, got {goal.shape[-1]}"
+        
+        batch_size = waypoints.shape[0]
         device = waypoints.device
-        batch_size, num_p, dims = waypoints.shape
-        eps = 1e-6
+        
+        # --- 1. 提取每个 Batch 的“最后一个有效点” ---
+        if mask is not None:
+            # 计算有效长度
+            valid_len = (~mask).sum(dim=1).long()
+            # 最后一个有效点的索引 = 长度 - 1
+            last_idx = (valid_len - 1).clamp(min=0)
+        else:
+            last_idx = torch.full((batch_size,), waypoints.shape[1]-1, device=device, dtype=torch.long)
+            
+        # 使用 torch.gather 或高级索引提取终点状态
+        # waypoints[B, N, 4] -> end_state[B, 4]
+        # range(batch_size) 生成 [0, 1, ... B-1]
+        batch_indices = torch.arange(batch_size, device=device)
+        
+        end_pos = waypoints[batch_indices, last_idx, 0:2]  # [B, 2]
+        
+        # 提取目标状态
+        goal_pos = goal[:, 0:2]
 
-        # 如果没有传入 mask，创建一个全 False 的 mask (所有点有效)
-        if mask is None:
-            mask = torch.zeros((batch_size, num_p), dtype=torch.bool, device=device)
+        # --- 2. 终点位置代价 ---
+        dist_diff = torch.norm(end_pos - goal_pos, p=2, dim=1)
+        loss_endpoint = torch.mean(torch.log(dist_diff + 1.0))
+        
+        # --- 3. 新增: 所有有效点到目标的平均距离 ---
+        # 防止网络用mask"作弊"，只让最后一个点到达目标
+        goal_expanded = goal_pos.unsqueeze(1)  # [B, 1, 2]
+        dists_to_goal = torch.norm(waypoints - goal_expanded, p=2, dim=2)  # [B, N]
+        
+        if mask is not None:
+            dists_to_goal = dists_to_goal.masked_fill(mask, 0.0)
+            valid_counts = (~mask).sum(dim=1).float() + 1e-6
+            avg_dist = torch.sum(dists_to_goal, dim=1) / valid_counts
+        else:
+            avg_dist = torch.mean(dists_to_goal, dim=1)
+        
+        loss_avg_dist = torch.mean(torch.log(avg_dist + 1.0))
+        
+        # --- 4. 新增: 方向一致性损失 - 惩罚远离目标的运动 ---
+        # 计算每个路径点到目标的向量
+        vec_to_goal = goal_expanded - waypoints  # [B, N, 2]
+        # 计算路径段向量 (运动方向)
+        motion_vec = waypoints[:, 1:, :] - waypoints[:, :-1, :]  # [B, N-1, 2]
+        # 计算对应位置到目标的向量 (使用起点)
+        vec_to_goal_seg = vec_to_goal[:, :-1, :]  # [B, N-1, 2]
+        
+        # 计算余弦相似度: cos(θ) = (a·b) / (|a||b|)
+        dot_product = torch.sum(motion_vec * vec_to_goal_seg, dim=2)  # [B, N-1]
+        norm_motion = torch.norm(motion_vec, dim=2) + 1e-6  # [B, N-1]
+        norm_goal = torch.norm(vec_to_goal_seg, dim=2) + 1e-6  # [B, N-1]
+        cos_similarity = dot_product / (norm_motion * norm_goal)  # [B, N-1], 范围[-1,1]
+        
+        # 我们希望cos接近+1 (同向), 惩罚<0 (反向)的情况
+        # 使用 (1 - cos) 作为损失, 范围[0,2], 同向时为0, 反向时为2
+        direction_loss_raw = 1.0 - cos_similarity  # [B, N-1]
+        
+        if mask is not None:
+            seg_mask = mask[:, 1:]
+            direction_loss_raw = direction_loss_raw.masked_fill(seg_mask, 0.0)
+            valid_counts_seg = (~seg_mask).sum(dim=1).float() + 1e-6
+            loss_direction = torch.mean(torch.sum(direction_loss_raw, dim=1) / valid_counts_seg)
+        else:
+            loss_direction = torch.mean(direction_loss_raw)
+        
+        # --- 5. 综合损失: 终点 + 平均距离 + 方向一致性 ---
+        loss_pos = 0.3 * loss_endpoint + 0.3 * loss_avg_dist + 0.4 * loss_direction
+        
+        return loss_pos, {
+            "pos": loss_pos, 
+            "endpoint": loss_endpoint.item(),
+            "avg": loss_avg_dist.item(),
+            "direction": loss_direction.item()
+        }
+    
+    def _compute_fear_loss(self, waypoints, oloss_M, fear_pred, batch_size, ahead_dist=2.0, mask=None):
+        """
+        计算碰撞恐惧损失 (Fear Loss)
+        Args:
+            waypoints:  [Batch, N, 2] 路径点
+            oloss_M:   [3 * Batch, N-1] 膨胀后的障碍物代价矩阵
+            fear_pred: [Batch, 1] 网络预测的恐惧值
+            batch_size: int
+            ahead_dist: float 预瞄距离
+            mask:      [Batch, N] (Optional) True表示无效点/Padding
 
-        # ==========================================
-        # 1. 计算物理量 (Derivatives)
-        # ==========================================
-        
-        # 速度向量 V [B, N-1, 2]
-        v_vec = waypoints[:, 1:] - waypoints[:, :-1]
-        # 速度 Mask [B, N-1] (如果终点 i+1 无效，则段 i 无效)
-        mask_v = mask[:, 1:] 
+        Returns:
+            loss: scalar
+        """
+        assert waypoints.shape[-1] == 2, f"waypoints last dim must be == 2, got {waypoints.shape[-1]}"
+        # 1. 计算每个路径点到起点的累积距离
+        pos_diff = waypoints[:, 1:, :] - waypoints[:, :-1, :]
+        wp_ds = torch.norm(pos_diff, dim=-1)  # [Batch, N-1]
 
-        # 加速度向量 A [B, N-2, 2]
-        a_vec = v_vec[:, 1:] - v_vec[:, :-1]
-        # 加速度 Mask [B, N-2]
-        mask_a = mask[:, 2:]
+        if mask is not None:
+            seg_mask = mask[:, 1:]
+            wp_ds = wp_ds.masked_fill(seg_mask, 0.0)
 
-        # 加加速度向量 Jerk [B, N-3, 2]
-        j_vec = a_vec[:, 1:] - a_vec[:, :-1]
-        # Jerk Mask [B, N-3]
-        mask_j = mask[:, 3:]
-
-        # ==========================================
-        # 2. 计算各项 Loss (Apply Mask)
-        # ==========================================
+        goal_dists = torch.cumsum(wp_ds, dim=1)
         
-        # --- A. Accel Loss (平滑性 - 二阶导 L2) ---
-        # 计算平方和: [B, N-2]
-        acc_sq = torch.sum(a_vec ** 2, dim=-1)
-        # 将无效部分的 Loss 设为 0
-        acc_sq = acc_sq.masked_fill(mask_a, 0.0)
-        # 计算分母：每个 Batch 有效的加速度点数
-        valid_count_a = (~mask_a).sum(dim=1).clamp(min=1.0) # [B]
-        # 求均值: 这里的均值是对“有效点”求均值
-        acc_loss = torch.mean(torch.sum(acc_sq, dim=1) / valid_count_a)
-
-        # --- B. Jerk Loss (舒适度 - 三阶导 L2) ---
-        jerk_sq = torch.sum(j_vec ** 2, dim=-1)
-        jerk_sq = jerk_sq.masked_fill(mask_j, 0.0)
-        valid_count_j = (~mask_j).sum(dim=1).clamp(min=1.0)
-        jerk_loss = torch.mean(torch.sum(jerk_sq, dim=1) / valid_count_j)
-
-        # --- C. Curvature Loss (几何平滑 - 余弦相似度) ---
-        # 归一化速度向量 (防止除以0)
-        v_norm = torch.norm(v_vec, dim=-1, keepdim=True) + eps
-        v_dir = v_vec / v_norm # [B, N-1, 2]
+        goal_dists_stacked = torch.vstack([goal_dists] * 3)
         
-        # 计算相邻向量的点积 (Cosine Similarity) -> [B, N-2]
-        cos_sim = torch.sum(v_dir[:, :-1] * v_dir[:, 1:], dim=-1)
+        floss_M = oloss_M.clone()
         
-        # Loss = 1 - cos_sim (1.0是直线, -1.0是掉头)
-        # 只有当两个向量都有效时，夹角才有效 -> 使用 mask_a
-        curv_val = 1.0 - cos_sim
-        curv_val = curv_val.masked_fill(mask_a, 0.0)
-        # 分母使用 mask_a 的计数
-        curvature_loss = torch.mean(torch.sum(curv_val, dim=1) / valid_count_a)
-
-        # --- D. Uniformity Loss (速度均匀性) ---
-        # 我们希望在一条轨迹内部，速度大小是恒定的 (方差为0)
-        # 速度大小: [B, N-1]
-        v_mags = torch.norm(v_vec, dim=-1)
+        floss_M[goal_dists_stacked > ahead_dist] = 0.0
         
-        # 1. 先把无效速度设为 0，方便求和
-        v_mags_clean = v_mags.masked_fill(mask_v, 0.0)
-        # 2. 计算每个 Batch 的平均速度
-        valid_count_v = (~mask_v).sum(dim=1).clamp(min=1.0)
-        mean_v = torch.sum(v_mags_clean, dim=1, keepdim=True) / valid_count_v.unsqueeze(1) # [B, 1]
+        max_vals, _ = torch.max(floss_M, dim=1, keepdim=True)
         
-        # 3. 计算方差 (v - mean_v)^2
-        # 注意：这里不仅要 mask 计算结果，还要确保不要把 padding 的 0 和 mean_v 做差导致产生 loss
-        var_v = (v_mags - mean_v) ** 2
-        var_v = var_v.masked_fill(mask_v, 0.0)
+        # B. 阈值判断：超过阈值即视为危险
+        is_collision = max_vals > self.obstalce_thread
         
-        uniformity_loss = torch.mean(torch.sum(var_v, dim=1) / valid_count_v)
-
-        # --- E. [新增] Length Loss (路径总长度最小化) ---
-        # 目的：消除绕路，拉紧轨迹
-        # 使用 v_mags (每段的长度)
-        # 注意：这里我们求 SUM (总长度)，而不是 Mean (平均步长)
+        fear_labels = is_collision.view(3, batch_size, -1).any(dim=0).float()  # [B, 1]
         
-        # 1. 确保无效段长度为 0
-        # --- E. [修改] Energy Loss (弹簧能量损失 - 长度平方和) ---
-        # 目的：
-        # 1. Shortest Path: 缩短总路径
-        # 2. Uniformity: 强迫点与点之间间距相等 (因为 a^2+b^2 >= 2ab, 均分时最小)
+        # 7. 计算 Loss
+        if fear_pred.shape != fear_labels.shape:
+            fear_pred = fear_pred.view_as(fear_labels)
+            
+        loss = nn.BCELoss()(fear_pred, fear_labels)
         
-        # 1. 计算长度平方 [B, N-1]
-        dist_sq = v_mags ** 2
+        return loss
+    
+    def _compute_motion_loss(self, waypoints: torch.Tensor, mask: Optional[torch.Tensor], dt: float, goal: torch.Tensor, num_keypoints: int = 32):
+        """
+            计算运动平滑损失 (Motion Smoothness Loss)
+            
+            关键修正: 参考轨迹应该使用 keypoints 数量(32)，而不是密集插值数量(321)
+            - 从(0,0)到goal生成 num_keypoints 个均匀参考点
+            - 对密集轨迹进行采样，取出对应 keypoints 的位置
+            - 比较采样后的实际路径和参考路径的间距差异
+            
+            Args:
+                waypoints: [Batch, N, 2] 插值后的密集路径点 (N=321)
+                mask: [Batch, N] (Optional) True表示无效点/Padding
+                dt: float 时间步长
+                goal: [Batch, 2] 终点位置
+                num_keypoints: int 关键点数量 (默认32)
+            
+            Returns:
+                loss: scalar
+        """
+        batch_size, num_dense, _ = waypoints.shape
         
-        # 2. Mask 掉无效段 (设为 0)
-        dist_sq = dist_sq.masked_fill(mask_v, 0.0)
+        # 生成参考轨迹: 从(0,0)到goal的 num_keypoints 个均匀点
+        step_size = 1.0 / (num_keypoints - 1)
+        desired_wp = self.opt.TrajGeneratorFromPFreeRot(goal[:, None, 0:2], step=step_size)  # [B, num_keypoints, 2]
         
-        # 3. 对每条轨迹求和 [B]
-        # 注意：这里是 Sum，代表整条轨迹的总能量
-        trajectory_energy = torch.sum(dist_sq, dim=1)
+        # 从密集轨迹中采样出对应 keypoints 的位置
+        # 计算采样索引: 均匀分布在 [0, num_dense-1]
+        sample_indices = torch.linspace(0, num_dense - 1, num_keypoints, device=waypoints.device).long()  # [num_keypoints]
+        sampled_waypoints = waypoints[:, sample_indices, :]  # [B, num_keypoints, 2]
         
-        # 4. Batch 平均
-        length_loss = torch.mean(trajectory_energy)
-        # ==========================================
-        # 3. 组合权重
-        # ==========================================
-        # 权重建议：
-        # Accel: 最核心，拉直轨迹
-        # Jerk: 辅助，微调
-        # Curv: 关键，防止急转弯 (数值通常在 0~2 之间，权重给高一点)
-        # Uniform: 辅助，防止点堆积
+        # 计算参考间距
+        desired_ds = torch.norm(desired_wp[:, 1:, :] - desired_wp[:, :-1, :], dim=2)  # [B, num_keypoints-1]
         
-        total_motion_loss = (
-            1.0 * acc_loss + 
-            0.5 * jerk_loss + 
-            2.0 * curvature_loss +  # 提高权重，因为这个 Loss 很重要
-            0.5 * uniformity_loss + 
-            5 * length_loss
-        )
-
-        return total_motion_loss, acc_loss, curvature_loss
+        # 计算实际间距 (基于采样的 keypoints)
+        wp_ds = torch.norm(sampled_waypoints[:, 1:, :] - sampled_waypoints[:, :-1, :], dim=2)  # [B, num_keypoints-1]
+        
+        # 应用mask (注意：这里的mask是针对密集轨迹的，需要采样)
+        if mask is not None:
+            sampled_mask = mask[:, sample_indices]  # [B, num_keypoints]
+            seg_mask = sampled_mask[:, 1:]  # [B, num_keypoints-1]
+            mloss = torch.abs(desired_ds - wp_ds)
+            mloss = mloss.masked_fill(seg_mask, 0.0)
+            valid_counts = (~seg_mask).sum(dim=1).float() + 1e-6
+            mloss = torch.sum(mloss, dim=1) / valid_counts
+            mloss = torch.mean(mloss)
+        else:
+            mloss = torch.abs(desired_ds - wp_ds)
+            mloss = torch.sum(mloss, axis=1)
+            mloss = torch.mean(mloss)
+        
+        return mloss
+    
     # 计算轨迹总代价 CostofTraj (核心函数)
     def CostofTraj(
+        self,
+        waypoints: torch.Tensor,  # [B, N, 2] 插值后的密集轨迹
+        goal: torch.Tensor,
+        fear: torch.Tensor,
+        log_step: int,
+        ahead_dist: float,
+        step: float = 0.2,
+        dataset: str = "train",
+        mask: Optional[torch.Tensor] = None,  # [B, N] 密集轨迹的mask
+        num_keypoints: int = 32,  # 关键点数量，用于motion loss计算
+    ):
+        
+        # Use mask to keep only valid waypoints up to the max valid length across the batch
+        if mask is not None:
+            valid_len = (~mask).sum(dim=1).long()
+            max_valid = int(torch.clamp(valid_len.max(), min=2).item())
+            waypoints = waypoints[:, :max_valid, :]
+            mask = mask[:, :max_valid]
+        
+        return self.CostofTrajVI(waypoints, None, goal, fear, log_step, ahead_dist, dataset)
+
+    def CostofTrajVI(
         self,
         waypoints: torch.Tensor,
         odom: torch.Tensor,
@@ -377,128 +437,74 @@ class TrajCost:
         log_step: int,
         ahead_dist: float,
         dataset: str = "train",
-        mask: Optional[torch.Tensor] = None, # <--- 新增 mask 参数 [B, K] (True表示无效)
     ):
         batch_size, num_p, _ = waypoints.shape
+
         assert self.is_map, "Map has to be set for cost calculation"
+        # world_ps = self.TransformPoints(odom, waypoints).tensor()
 
-        # 1. 计算原始 Obstacle Loss 矩阵 [B, K]
+        # Obstacle loss
         oloss_M = self._compute_oloss(waypoints, batch_size)
-        
-        # === 修正 A: 应用 Mask 到 oloss ===
-        if mask is not None:
-            # oloss_M 的长度是 N-1，而 mask 的长度是 N
-            # 我们必须对 mask 进行切片以匹配 oloss_M
-            # 策略: 如果点 i+1 无效，则认为从 i 到 i+1 的段（oloss_M[i]）无效
-            seg_mask = mask[:, 1:]  # [B, N-1]
-            
-            # 使用切片后的 mask 进行填充
-            oloss_M = oloss_M.masked_fill(seg_mask, 0.0)
-            
-            # 计算平均值时，分母应该是有效段的数量
-            valid_counts = (~seg_mask).sum(dim=1) + 1e-6
-            # 注意：这里的 num_p 是 N，但 oloss_M 是 N-1。
-            # 为了保持量级，乘以 (num_p - 1) 可能更准确，或者保持 num_p 也行，差别不大
-            oloss = torch.mean(torch.sum(oloss_M, axis=1) / valid_counts * (num_p - 1))
-        else:
-            oloss = torch.mean(torch.sum(oloss_M, axis=1))
+        oloss = torch.mean(torch.sum(oloss_M, axis=1))
 
-        # 2. Goal Loss (通常只看最后一个点，或者看 Mask 之前的最后一个有效点)
-        # 如果你已经有了变长逻辑，Gloss 应该取最后一个“有效”点，而不是数组的最后一个点
-        if mask is not None:
-            # 找到每个 batch 最后一个有效点的索引
-            # mask: True 是无效，False 是有效
-            # valid_len = (~mask).sum(dim=1)
-            # last_valid_idx = valid_len - 1
-            # end_points = waypoints[torch.arange(batch_size), last_valid_idx]
-            
-            # 简化版：通常 TrajGenerator 会把多余的点堆在最后，所以直接取 -1 也可以
-            # 只要网络学会把点堆在终点，取 -1 和取 last_valid 是一样的
-            # gloss_M = torch.norm(goal[:, :2] - waypoints[:, -1, :2], dim=1)
-            valid_len = (~mask).sum(dim=1).long()
-            last_valid_idx = (valid_len - 1).clamp(min=0)
-            batch_idx = torch.arange(waypoints.shape[0], device=waypoints.device)
-            end_points = waypoints[batch_idx, last_valid_idx, :2]
-            gloss_M = torch.norm(goal[:, :2] - end_points, dim=1)
-        else:
-            gloss_M = torch.norm(goal[:, :2] - waypoints[:, -1, :2], dim=1)
-            
+        # Goal Cost - Control Cost
+        gloss_M = torch.norm(goal[:, :2] - waypoints[:, -1, :2], dim=1)
+        # gloss = torch.mean(gloss_M)
         gloss = torch.mean(torch.log(gloss_M + 1.0))
 
-        # 3. Moving Loss (平滑性)
-        
-        desired_wp = self.opt.TrajGeneratorFromPFreeRot(goal[:, None, 0:2], step=1.0 / (num_p - 1), start_vel=odom[:, 2:4], goal_vel=goal[:, 2:4])
-        
+        # Moving Loss - punish staying
+        desired_wp = self.opt.TrajGeneratorFromPFreeRot(goal[:, None, 0:2], step=1.0 / (num_p - 1))
         desired_ds = torch.norm(desired_wp[:, 1:num_p, :] - desired_wp[:, 0 : num_p - 1, :], dim=2)
         wp_ds = torch.norm(waypoints[:, 1:num_p, :] - waypoints[:, 0 : num_p - 1, :], dim=2)
-              
-        raw_mloss = torch.abs(desired_ds - wp_ds)
-        
-        # === 修正 B: 应用 Mask 到 mloss ===
-        if mask is not None:
-            # mask 的维度通常对应点，而 ds 对应段 (点数-1)
-            # 我们取段起点的 mask 作为该段的 mask
-            # mask[:, :-1]
-            seg_mask = mask[:, 1:] # 如果终点无效，那连接终点的线段也无效
-            
-            raw_mloss = raw_mloss.masked_fill(seg_mask, 0.0)
-            valid_seg_counts = (~seg_mask).sum(dim=1) + 1e-6
-            mloss = torch.mean(torch.sum(raw_mloss, axis=1) / valid_seg_counts) # 已经被 mask 了，直接求和
-        else:
-            mloss = torch.sum(raw_mloss, axis=1) # 已经被 mask 了，直接求和
-            
+        mloss = torch.abs(desired_ds - wp_ds)
+        mloss = torch.sum(mloss, axis=1)
         mloss = torch.mean(mloss)
-        # print(f"[DEBUG] mloss final value:\n{mloss.detach().cpu().numpy()}")
-        
-        # mloss, acc_debug, curv_debug = self._compute_motion_loss(waypoints, mask)
-        v_vec = waypoints[:, 1:] - waypoints[:, :-1]
-        v_mags = torch.norm(v_vec, dim=-1)
-        dist_sq = v_mags ** 2
-        mask_v = mask[:, 1:]
-        # 2. Mask 掉无效段 (设为 0)
-        dist_sq = dist_sq.masked_fill(mask_v, 0.0)
-        
-        # 3. 对每条轨迹求和 [B]
-        # 注意：这里是 Sum，代表整条轨迹的总能量
-        trajectory_energy = torch.sum(dist_sq, dim=1)
-        
-        
-        # Complete Trajectory Loss
-        trajectory_loss = self.w_obs * oloss + self.w_motion * mloss + self.w_goal * gloss + 0.5 * torch.mean(trajectory_energy)
-        print(f"Obs: {self.w_obs*oloss:.4f}, Motion: {self.w_motion*mloss:.4f}, Goal: {self.w_goal*gloss:.4f}")
-        
-        # Fear labels # 计算路径累积距离
-        goal_dists = torch.cumsum(wp_ds, dim=1, dtype=wp_ds.dtype)
-        # print(f"[DEBUG] goal_dists values before vstack:\n{goal_dists.detach().cpu().numpy()}")
-        goal_dists = torch.vstack([goal_dists] * 3)
-        # print(f"[DEBUG] goal_dists values after vstack:\n{goal_dists.detach().cpu().numpy()}")
-        # oloss_M (原始障碍物代价图)
-        floss_M = torch.clone(oloss_M)
-        # 忽略超过一定预瞄距离(ahead_dist)后的障碍物影响
-        floss_M[goal_dists > ahead_dist] = 0.0
-        # print(f"[DEBUG] floss_M values after masking:\n{floss_M.detach().cpu().numpy()}")
-        # 如果路径上某点的障碍物值超过阈值，则标记为“危险” (Label=1)
-        # 在当前的一条轨迹中，寻找最大的障碍物代价值。
-        fear_labels = torch.max(floss_M, 1, keepdim=True)[0]
-        # print(f"[DEBUG] fear_labels values before thresholding:\n{fear_labels.detach().cpu().numpy()}")
-        # fear_labels = nn.Sigmoid()(fear_labels-obstalce_thread) 
-        # 如果这条路径上（在 ahead_dist 范围内）遇到的最大障碍物代价超过了阈值（obstalce_thread），则认为这条路是死路或危险路径
-        fear_labels = fear_labels > self.obstalce_thread
-        # print(f"[DEBUG] fear_labels values after thresholding:\n{fear_labels.detach().cpu().numpy()}")
-        fear_labels = torch.any(fear_labels.reshape(3, batch_size).T, dim=1, keepdim=True).to(torch.float32)
-        # print(f"[DEBUG] final fear_labels values:\n{fear_labels.detach().cpu().numpy()}")
-        # Fear loss # 计算二元交叉熵损失 (BCE Loss)，训练网络预测“恐惧”
-        # fear：这是神经网络预测出来的碰撞概率（0~1之间）。
-        # fear_labels：这是上面根据地图计算出来的实际碰撞情况（0或1）。
-        # 含义：使用二元交叉熵损失（BCE Loss）来训练神经网络，使其能根据图像输入准确预测当前的危险程度。
-        if fear.shape != fear_labels.shape:
-            fear = fear.view_as(fear_labels)
-        collision_probabilty_loss = nn.BCELoss()(fear, fear_labels.float())
-        # print(f"[DEBUG] collision_probabilty_loss value:\n{collision_probabilty_loss.detach().cpu().numpy()}")
-        print(f"Collision Probabilty Loss: {collision_probabilty_loss:.4f}")
-        # TODO: kinodynamics cost
-        return collision_probabilty_loss + trajectory_loss
 
+        # Complete Trajectory Loss + self.w_motion * mloss
+        # 
+        trajectory_loss = self.w_obs * oloss + self.w_goal * gloss + self.w_motion * mloss
+
+        # Fear labels
+        goal_dists = torch.cumsum(wp_ds, dim=1, dtype=wp_ds.dtype)
+        goal_dists = torch.vstack([goal_dists] * 3)
+        floss_M = torch.clone(oloss_M)
+        floss_M[goal_dists > ahead_dist] = 0.0
+        fear_labels = torch.max(floss_M, 1, keepdim=True)[0]
+        # fear_labels = nn.Sigmoid()(fear_labels-obstalce_thread)
+        fear_labels = fear_labels > self.obstalce_thread
+        fear_labels = torch.any(fear_labels.reshape(3, batch_size).T, dim=1, keepdim=True).to(torch.float32)
+        # Fear loss
+        collision_probabilty_loss = nn.BCELoss()(fear, fear_labels.float())
+
+        # log
+        if self.log_data:
+            try:
+                wandb.log(
+                    {f"Obstacle Loss {dataset}": self.w_obs * oloss},
+                    step=log_step,
+                )
+                wandb.log(
+                    {f"Goal Loss {dataset}": self.w_goal * gloss},
+                    step=log_step,
+                )
+                wandb.log(
+                    {f"Motion Loss {dataset}": self.w_motion * mloss},
+                    step=log_step,
+                )
+                wandb.log(
+                    {f"Trajectory Loss {dataset}": trajectory_loss},
+                    step=log_step,
+                )
+                wandb.log(
+                    {f"Collision Loss {dataset}": collision_probabilty_loss},
+                    step=log_step,
+                )
+            except:  # noqa: E722
+                print("wandb log failed")
+
+        # TODO: kinodynamics cost
+        return trajectory_loss
+        # return collision_probabilty_loss + trajectory_loss
 
     def obs_cost_eval(self, odom: torch.Tensor, waypoints: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compute Obstacle Loss for eval_sim_static script!

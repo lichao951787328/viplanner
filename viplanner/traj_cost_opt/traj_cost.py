@@ -102,6 +102,8 @@ class TrajCost:
 
         return
 
+    
+
     # 计算轨迹总代价 CostofTraj (核心函数)
     def CostofTraj(
         self,
