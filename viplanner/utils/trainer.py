@@ -380,7 +380,8 @@ class Trainer:
 
         for generator in self.data_generators:  # 遍历所有数据生成器
             # init data classes
-
+            # 每个数据集的生成器对应两个数据集实例：训练集和验证集
+            # 第一步，先创建验证数据集实例
             val_data = PlannerData(  # 创建验证数据集实例
                 cfg=generator._cfg,
                 transform=self.transform,
@@ -403,6 +404,7 @@ class Trainer:
                 train_data = None
 
             # split data in train and validation with given sample ratios
+            # 第二步，使用生成器根据采样比例分割训练和验证数据集
             if train:
                 generator.split_samples(  # 分割训练和验证数据集
                     train_dataset=train_data,
@@ -429,6 +431,7 @@ class Trainer:
                     train_data.load_data_in_memory()  # 将训练数据加载到内存
                 val_data.load_data_in_memory()  # 将验证数据加载到内存
 
+            # 绑定关系：当你写 Data.DataLoader(dataset=train_data, ...) 时，你实际上是把刚才那个“灌满了特定难度样本”的桶（Dataset）放到了传送带（DataLoader）上。
             if train:
                 train_loader = Data.DataLoader(  # 创建训练数据加载器
                     dataset=train_data,

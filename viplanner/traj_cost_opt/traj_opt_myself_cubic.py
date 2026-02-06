@@ -6,7 +6,7 @@
 # 在 PyTorch 框架下实现轨迹插值和平滑。它利用**三次样条插值（Cubic Spline Interpolation）**将稀疏的路径点（比如神经网络预测的几个关键点）转换成平滑、连续的高分辨率轨迹。
 # 由于完全使用 PyTorch 操作，这整个过程是可微分的，意味着它可以直接嵌入到神经网络的训练流程中，允许梯度反向传播。
 import torch
-
+from torch.nn.utils.rnn import pad_sequence
 torch.set_default_dtype(torch.float32)
 
 # 实现了基于 Hermite 样条的三次插值数学逻辑
@@ -52,6 +52,7 @@ class CubicSplineTorch:
         m = torch.cat([m[:, None, 0], (m[:, 1:] + m[:, :-1]) / 2, m[:, None, -1]], 1)
         # 2. 确定 xs 中的每个点落在原始 x 的哪一段区间内
         idxs = torch.searchsorted(x[0, 1:], xs[0, :])
+        idxs = torch.clamp(idxs, max=x.shape[1] - 2)
         # 计算该段区间的长度 dx
         dx = x[:, idxs + 1] - x[:, idxs]
         # 3. 计算归一化时间 t = (当前点 - 区间起点) / 区间长度
@@ -129,13 +130,52 @@ class TrajOpt:
 
     # 从预测点生成轨迹
     def TrajGeneratorFromPFreeRot(self, preds, step, mask=None):
-        if mask is not None:
-            valid_len = (~mask).sum(dim=1).long()
-            max_valid = int(torch.clamp(valid_len.max(), min=2).item())
-            preds = preds[:, :max_valid, :]
-            mask = mask[:, :max_valid]
-            # print(f"[DEBUG] TrajGeneratorFromPFreeRot max_valid: {max_valid}")
-        return self.TrajGeneratorFromPFreeRotVI(preds, step)
+        if mask is None:
+            return self.TrajGeneratorFromPFreeRotVI(preds, step)
+        
+        # 1. 计算每个样本的有效长度
+        # mask: True 表示无效/Padding
+        valid_lens = (~mask).sum(dim=1).long()  # [Batch]
+        
+        batch_size = preds.shape[0]
+        interpolated_trajs = []
+        
+        # 2. 循环处理每个样本 (Loop over Batch)
+        for i in range(batch_size):
+            curr_len = valid_lens[i]
+            
+            # 拿到当前样本的有效控制点 [Valid_N, 2]
+            # 这一步非常关键：彻底剔除了尾部的垃圾数据
+            curr_pred = preds[i, :curr_len, :] 
+            
+            # 升维成 [1, Valid_N, 2] 传给插值函数
+            # 注意：这里的 step 决定了输出的密度，由于 curr_len 不同，
+            # 生成出来的轨迹长度 M 也会不同！
+            curr_traj = self.TrajGeneratorFromPFreeRotVI(curr_pred.unsqueeze(0), step)
+            
+            # 降维回 [M, 2] 并存入列表
+            interpolated_trajs.append(curr_traj.squeeze(0))
+
+        # 3. 将变长的轨迹重新 Padding 成 Batch Tensor
+        # pad_sequence 会自动把短的轨迹后面补 0，对齐到最长的轨迹
+        # 输出: [Batch, Max_M, 2]
+        waypoints_batch = pad_sequence(interpolated_trajs, batch_first=True, padding_value=0.0)
+        
+        # 4. (可选) 可视化调试
+        if self.debug and batch_size > 0:
+            import matplotlib.pyplot as plt
+            idx = 0 # 看第一个样本
+            orig = preds[idx, :valid_lens[idx]].detach().cpu().numpy()
+            interp = waypoints_batch[idx].detach().cpu().numpy()
+            # 剔除掉 padding 的 0 (假设 trajectory 不会正好在 0,0 结束)
+            # 或者简单画图不剔除也行
+            plt.figure()
+            plt.scatter(orig[:,0], orig[:,1], c='purple', label='Control Points')
+            plt.plot(interp[:,0], interp[:,1], c='blue', label='Interp Traj')
+            plt.title(f"Sample 0 (Valid Len: {valid_lens[idx]})")
+            plt.show()
+
+        return waypoints_batch
 
     # 简单的双线性插值
     # 这是一个备选方案，比三次样条更简单、计算更快，但平滑度较差（一阶导数不连续，生成的轨迹是折线）。

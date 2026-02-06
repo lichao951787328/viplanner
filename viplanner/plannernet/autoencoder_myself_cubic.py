@@ -117,6 +117,8 @@ class DecoderGridDynamic(nn.Module):
         # 计算每个样本目标的实际距离
         dist_to_goal = torch.norm(goal, p=2, dim=1)  # [Batch]
         
+        
+        
         # 计算实际需要的点数 (向上取整)
         num_valid_points = torch.ceil((dist_to_goal / self.step_size) * 1.25).long().clamp(min=1, max=self.max_k)
         # print(f"[DEBUG] num_valid_points: {num_valid_points}")

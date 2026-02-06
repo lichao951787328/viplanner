@@ -1,0 +1,1 @@
+tensorboard --logdir="/home/eai/VLN/viplanner/rotated_out/carla/logs_v2/tb" --port=6009

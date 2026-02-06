@@ -2,7 +2,7 @@
 Author: lichao951787328 951787328@qq.com
 Date: 2026-01-20 15:26:31
 LastEditors: lichao951787328 951787328@qq.com
-LastEditTime: 2026-01-22 16:17:53
+LastEditTime: 2026-02-04 17:51:22
 FilePath: /viplanner/viplanner/utils/dataset_myself_.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -167,6 +167,7 @@ class PlannerData(Dataset):
         k = random.choice([3, 5])
         print(f"Blur applied with kernel size {k}.")
         return cv2.GaussianBlur(image, (k, k), random.uniform(0.5, 1.5))
+
 
     # def _add_random_polygons(self, image, nb_polygons, max_size):
     #     for i in range(nb_polygons):

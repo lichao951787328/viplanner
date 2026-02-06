@@ -83,7 +83,7 @@ class Decoder(nn.Module):
 
         # # 卷积层：融合图像特征和Goal特征
         self.conv1 = nn.Conv2d(
-            (in_channels + goal_channels), # 输入通道 = 图像特征通道 + Goal通道
+            (in_channels + goal_channels),  # 输入通道 = 图像特征通道 + Goal通道
             512,
             kernel_size=5,
             stride=1,
@@ -94,9 +94,9 @@ class Decoder(nn.Module):
         # 全连接层用于生成路径点
         self.fc1 = nn.Linear(256 * 128, 1024) # 输入维度取决于上一层卷积输出的尺寸 (需根据输入图像大小计算)
         self.fc2 = nn.Linear(1024, 512)
-        self.fc3 = nn.Linear(512, k * 3) # 输出 k 个点，每个点 (x, y, z)
+        self.fc3 = nn.Linear(512, k * 3) # 输出 k 个点，每个点 (x, y, z)  路径生成器
 
-        # # 分支全连接层用于生成成本/碰撞概率
+        # # 分支全连接层用于生成成本/碰撞概率 裁判员 (The Critic)
         self.frc1 = nn.Linear(1024, 128)
         self.frc2 = nn.Linear(128, 1)
 
