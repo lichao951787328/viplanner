@@ -6,7 +6,7 @@ import torch
 import torch.optim as optim
 import numpy as np
 import matplotlib
-# matplotlib.use('Agg')
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -16,7 +16,19 @@ from torch.utils.tensorboard import SummaryWriter
 import shutil
 import pdb
 import heapq
-Debug = False
+Debug = True  # 是否开启调试模式 (打印更多信息，保存中间结果等)
+USING_transformer = False  # 是否使用 Transformer 版本的 PlannerNet
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import argparse
+
+try:
+    cv2.setNumThreads(0)
+    cv2.ocl.setUseOpenCL(False)
+    print("[INFO] OpenCV threading disabled explicitly.")
+except Exception as e:
+    print(f"[WARN] Failed to disable OpenCV threading: {e}")
 
 # ==========================================
 # 1. 路径修复 (关键步骤)
@@ -45,6 +57,7 @@ try:
     # B. 导入父目录下的模块 (现在可以直接从文件夹名开始了)
     # 对应: .../viplanner/plannernet/autoencoder_myself_cubic.py
     from plannernet.autoencoder_myself_cubic_dj import AutoEncoderGrid
+    from plannernet.planner_transformer import TransformerPlanner
     
     # 对应: .../viplanner/traj_cost_opt/traj_cost_myself_cubic.py
     from traj_cost_opt.traj_cost_myself_cubic import TrajCost
@@ -71,22 +84,23 @@ class Config:
         self.log_dir = "/home/eai/VLN/viplanner/rotated_out/carla/logs_v2"              # 可视化结果保存路径
         
         # 训练超参数
-        self.epochs = 125
-        self.batch_size = 64    # 根据显存大小调整，取2先试试
+        self.epochs = 10000
+        self.batch_size = 2    # 根据显存大小调整，取2先试试
         self.lr = 5e-4
-        self.num_workers = 4
+        self.num_workers = 32
         
         # 地图相关
         self.map_size = 80
         self.max_dist = 4.0    # 预测最远距离
-        self.step_size = 0.5    # 轨迹点间隔 (注意：您改成了 0.3)
+        self.step_size = 1    # 轨迹点间隔
         self.sub_step_size = 0.2  # 子轨迹点间隔, 用于计算更精细的成本
         self.resolution = 0.1   # 地图分辨率 (0.1m/pixel)
         
         # 损失权重 (传给 TrajCost)
-        self.w_obs = 2        # 障碍物避让权重
-        self.w_goal = 6.0       # 到达目标权重
-        self.w_motion = 1     # 平滑/动态权重
+        self.w_obs = 5       # 障碍物避让权重
+        self.w_goal = 1.2       # 到达目标权重
+        self.w_motion = 12     # 平滑/动态权重
+        self.w_guide = 1.0      # 引导点权重 (新添加)
         self.fear_ahead_dist = 2.0
         
         self.robot_width = 0.6     # 机器人宽度 (米)，用于计算左右边界点
@@ -107,39 +121,7 @@ class Config:
             "enable_blur": False
         }
 
-def dijkstra_length(cost_map, start_rc, goal_rc, res=0.1, occ_thresh=0.6):
-    h, w = cost_map.shape
-    sr, sc = start_rc
-    gr, gc = goal_rc
-    if not (0 <= sr < h and 0 <= sc < w and 0 <= gr < h and 0 <= gc < w):
-        return None
-    if cost_map[sr, sc] > occ_thresh or cost_map[gr, gc] > occ_thresh:
-        return None
 
-    dist = np.full((h, w), np.inf, dtype=np.float32)
-    dist[sr, sc] = 0.0
-    pq = [(0.0, sr, sc)]
-
-    nbrs = [
-        (-1, 0, res), (1, 0, res), (0, -1, res), (0, 1, res),
-        (-1, -1, res * np.sqrt(2)), (-1, 1, res * np.sqrt(2)),
-        (1, -1, res * np.sqrt(2)), (1, 1, res * np.sqrt(2)),
-    ]
-
-    while pq:
-        d, r, c = heapq.heappop(pq)
-        if d != dist[r, c]:
-            continue
-        if (r, c) == (gr, gc):
-            return d
-        for dr, dc, wgt in nbrs:
-            nr, nc = r + dr, c + dc
-            if 0 <= nr < h and 0 <= nc < w and cost_map[nr, nc] <= occ_thresh:
-                nd = d + wgt
-                if nd < dist[nr, nc]:
-                    dist[nr, nc] = nd
-                    heapq.heappush(pq, (nd, nr, nc))
-    return None
         
         
 # ==========================================
@@ -178,7 +160,7 @@ class BatchTrajCost(TrajCost):
         grid = torch.stack((norm_col, norm_row), dim=-1)
         return torch.clamp(grid, -1.0, 1.0)
 
-    def CostofTraj_Batch(self, waypoints, goal, fear, log_step, ahead_dist, batch_maps, sub_step_size, mask=None):
+    def CostofTraj_Batch(self, waypoints, goal, fear, log_step, ahead_dist, batch_maps, sub_step_size, mask=None, distance=None, path_pixel_raw_tensor=None, path_dist_tensor=None):
         """
         Args:
             waypoints: [B, Max_Dense_Len, 2] 已经插值并补齐的密集轨迹
@@ -191,8 +173,10 @@ class BatchTrajCost(TrajCost):
 
         if torch.isnan(waypoints).any():
             print("[Error] Waypoints contain NaNs! Model outputs might be exploding.")
+            dummy_loss = waypoints.sum() * 0.0 
+            return dummy_loss, torch.tensor(0.0, device=device), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
             # 返回一个带梯度的伪 Loss 防止程序直接 Crash，或者选择 raise Error
-            return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
+            # return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(0.0, device=device), torch.tensor(0.0, device=device)
         
         # ============================================================
         # 1. 计算密集轨迹的 Valid Length 和 Mask
@@ -202,7 +186,7 @@ class BatchTrajCost(TrajCost):
             # mask True 为无效，取反求和
             valid_key_cnt = (~mask).sum(dim=1).float() # [B]
             global Debug
-            if Debug:
+            if Debug :
                 print(f"[DEBUG] valid_key_cnt: {valid_key_cnt}")
                 pdb.set_trace()
             # B. 推算插值后的有效数量 (Dense Valid Count)
@@ -266,7 +250,7 @@ class BatchTrajCost(TrajCost):
         # ============================================================
         # 不能直接取 waypoints[:, -1]，因为那里可能是补齐的 0
         # 我们利用 valid_dense_len 找到每个 Batch 真实的最后一个点的索引
-        last_indices = (valid_dense_len - 1).clamp(min=0, max = max_dense_len - 1)  # [B]
+        last_indices = (valid_dense_len - 1).clamp(min=0, max=max_dense_len - 1)  # [B]
         
         # 使用 gather 提取每个样本对应的终点
         # gather 需要 indices 维度匹配: [B, 1, 2]
@@ -282,67 +266,220 @@ class BatchTrajCost(TrajCost):
             pdb.set_trace()
         
         gloss_M = torch.norm(goal[:, :2] - real_endpoints, dim=1)
-        gloss = torch.mean(gloss_M ** 2.0)  # 乘以2是为了让数值更大一些，您可以根据实际情况调整
+        gloss = torch.mean(torch.log(gloss_M + 1.0))  # 乘以2是为了让数值更大一些，您可以根据实际情况调整
 
         # ============================================================
-        # 4. Motion Loss (平滑度：基于动态有效长度计算)
+        # 4. Motion Loss (修正版：自适应均布)
         # ============================================================
         # 计算相邻点距离 (实际步长) [B, N-1]
         wp_ds = torch.norm(waypoints[:, 1:] - waypoints[:, :-1], dim=2)
         
+        # Mask 掉无效的段 (dense_mask[:, 1:] 对应 N-1 个段)
+        seg_mask = dense_mask[:, 1:]  # [B, N-1]
         if Debug:
             print(f"[DEBUG] wp_ds shape: {wp_ds.shape}")
             print(f"[DEBUG] wp_ds:\n{wp_ds}")
+            print(f"[DEBUG] seg_mask shape: {seg_mask.shape}")
+            print(f"[DEBUG] seg_mask:\n{seg_mask}")
             pdb.set_trace()
-        # 计算"理想步长" (Ideal Step Size)
-        # 理想情况下，从起点(0,0)到目标(goal)应该是均匀分布的直线
-        # 理想步长 = (0到Goal的距离) / (有效段数)
-        # 注意：这里假设 waypoints 起点大约是 (0,0)
-        dist_to_goal = torch.norm(goal, dim=1)
-
-        with torch.no_grad():
-            cost_maps_np = batch_maps.detach().cpu().numpy()[:, 0]
-            map_res = 0.1
-            dist_list = []
-            for i in range(batch_size):
-                h, w = cost_maps_np[i].shape
-                c_row = h // 2
-                c_col = w // 2
-                g_row = int(round(c_row - goal[i, 0].item() / map_res))
-                g_col = int(round(c_col - goal[i, 1].item() / map_res))
-                g_row = int(np.clip(g_row, 0, h - 1))
-                g_col = int(np.clip(g_col, 0, w - 1))
-                d = dijkstra_length(cost_maps_np[i], (c_row, c_col), (g_row, g_col), res=map_res)
-                dist_list.append(d if d is not None else dist_to_goal[i].item())
-            dist_to_goal = torch.tensor(dist_list, device=device, dtype=waypoints.dtype) 
+            
+        # --- 核心修改开始 ---
         
+        # 1. 先把无效段的距离置为 0，防止影响求和
+        wp_ds_masked = wp_ds.masked_fill(seg_mask, 0.0)
+        if Debug:
+            print(f"[DEBUG] wp_ds_masked shape: {wp_ds_masked.shape}")
+            print(f"[DEBUG] wp_ds_masked:\n{wp_ds_masked}")
+            pdb.set_trace()
+        
+        # 2. 计算每条轨迹“当前实际”的平均步长 (Total Length / Valid Segments)
+        # 注意：这里不用 dist_to_goal (直线距离)，而是用 sum(wp_ds) (曲线距离)
+        # 这样无论路径多弯，我们只要求点之间是均匀的即可
+        current_path_len = torch.sum(wp_ds_masked, dim=1) # [B]
+        
+        # 加上 1e-6 防止除以0
         num_segments = (valid_dense_len - 1).float().clamp(min=1.0)
+        adaptive_mean_step = (current_path_len / num_segments).unsqueeze(1) # [B, 1]
         if Debug:
-            print(f"[DEBUG] dist_to_goal: {dist_to_goal}")
+            print(f"[DEBUG] current_path_len: {current_path_len}")
             print(f"[DEBUG] num_segments: {num_segments}")
+            print(f"[DEBUG] adaptive_mean_step: {adaptive_mean_step}")
             pdb.set_trace()
-        ideal_step = (dist_to_goal / num_segments).unsqueeze(1) # [B, 1]
-        if Debug:
-            print(f"[DEBUG] ideal_step: {ideal_step}")
-            pdb.set_trace()
-        # 损失 = abs(实际步长 - 理想步长)
-        mloss_per_step = torch.abs(wp_ds - ideal_step)
+            
+        # 3. 计算方差损失：(每个步长 - 当前平均步长)^2
+        # 这会让所有步长趋向于一致，而不限制总长度
+        mloss_per_step = (wp_ds - adaptive_mean_step) ** 2
+        
+        # 4. 再次 Mask (确保无效区域不计入 Loss)
+        mloss_per_step = mloss_per_step.masked_fill(seg_mask, 0.0)
         if Debug:
             print(f"[DEBUG] mloss_per_step shape: {mloss_per_step.shape}")
             print(f"[DEBUG] mloss_per_step:\n{mloss_per_step}")
             pdb.set_trace()
-        # Mask 掉无效的段 (dense_mask[:, 1:] 对应 N-1 个段)
-        seg_mask = dense_mask[:, 1:]
-        mloss_per_step = mloss_per_step.masked_fill(seg_mask, 0.0)
-        if Debug:
-            print(f"[DEBUG] mloss_per_step after masking:\n{mloss_per_step}")
-            pdb.set_trace()
-        # 平均
+            
+        # 5. 求平均
         mloss = torch.sum(mloss_per_step, dim=1) / num_segments
         mloss = torch.mean(mloss)
+        if Debug:
+            print(f"[DEBUG] mloss: {mloss}")
+            pdb.set_trace()
+            
+        # --- 核心修改结束 ---
+        # [可选] 增加一个微小的长度惩罚 (Length Regularization)
+        # 防止轨迹为了均匀而故意画蛇添足绕大圈
+        dist_to_goal = torch.norm(goal[:, :2], dim=1) 
+        l_reg = torch.mean(current_path_len / (dist_to_goal + 1e-6)) 
+        mloss += 0.01 * l_reg
+        
+        # ============================================================
+        # 5. Guide Loss (基于比例对齐 - 纯 Tensor 实现)
+        # ============================================================
+        loss_guide = torch.tensor(0.0, device=device)
+        
+        if path_pixel_raw_tensor is not None and path_dist_tensor is not None:
+            # --- A. 准备预测轨迹的比例 ---
+            # 补回第一个点的距离 0, 得到 [B, N]
+            zeros_col = torch.zeros((batch_size, 1), device=device)
+            # 累加距离 (Cumulative Sum)
+            wp_cum_dist = torch.cumsum(torch.cat([zeros_col, wp_ds_masked], dim=1), dim=1)
+            
+            # 获取每条轨迹的总长度 [B, 1]
+            # (不能直接取最后一个元素，因为后面可能是0，要取 valid_dense_len - 1)
+            # 利用前面计算好的 current_path_len 即可，但要注意 current_path_len 是标量
+            # 为了严谨，我们用 cum_dist 的 gather 方式
+            # torch.gather 对于每一行 i，取出第 index[i] 列的那个数
+            # unsqueeze 是 PyTorch（以及 NumPy 等库）中非常常用的一个函数，中文通常翻译为 “升维” 或 “增加维度”
+            wp_total_len = torch.gather(wp_cum_dist, 1, last_indices.unsqueeze(1))  # [B, 1]
+            if Debug:
+                print(f"[DEBUG] wp_cum_dist shape: {wp_cum_dist.shape}")
+                print(f"[DEBUG] wp_cum_dist:\n{wp_cum_dist}")
+                print(f"[DEBUG] wp_total_len shape: {wp_total_len.shape}")
+                print(f"[DEBUG] wp_total_len:\n{wp_total_len}")
+                pdb.set_trace()
+            # 计算比例 0.0 ~ 1.0 [B, N]
+            wp_ratios = wp_cum_dist / (wp_total_len + 1e-6)
+            # 确保比例在 [0, 1] 范围内 (数值误差可能导致略微越界)
+            wp_ratios = torch.clamp(wp_ratios, 0.0, 1.0)
+            
+            # --- B. 准备参考轨迹的比例 ---
+            # path_dist_tensor: [B, Ref_Len]
+            ref_total_len = path_dist_tensor[:, -1:]  # [B, 1]
+            ref_ratios = path_dist_tensor / (ref_total_len + 1e-6)  # [B, Ref_Len] 0~1
+            if Debug: 
+                print(f"[DEBUG] path_dist_tensor shape: {path_dist_tensor.shape}")
+                print(f"[DEBUG] path_dist_tensor:\n{path_dist_tensor}")
+                print(f"[DEBUG] ref_total_len shape: {ref_total_len.shape}")
+                print(f"[DEBUG] ref_total_len:\n{ref_total_len}")
+                print(f"[DEBUG] ref_ratios shape: {ref_ratios.shape}")
+                print(f"[DEBUG] ref_ratios:\n{ref_ratios}")
+                pdb.set_trace() 
+            # --- C. 批量插值 (Batch Linear Interpolation) ---
+            # 我们需要对于 wp_ratios 中的每个值，在 ref_ratios 中找到对应的位置，并对 path_pixel_raw_tensor 进行插值
+            
+            # 1. 找到右边界索引 (searchsorted)
+            # ref_ratios 是有序的，可以直接搜
+            # indices shape: [B, N]
+            idx_right = torch.searchsorted(ref_ratios, wp_ratios)
+            # 限制索引范围，防止越界 (clamp 到 [1, Ref_Len-1])
+            max_ref_idx = ref_ratios.shape[1] - 1
+            idx_right = torch.clamp(idx_right, 1, max_ref_idx)
+            idx_left = idx_right - 1
+            if Debug:
+                print(f"[DEBUG] idx_right:\n{idx_right}")
+                pdb.set_trace()
+            
+            # 2. Gather 参考数据
+            # 我们需要 gather 每一行对应的 indices。Torch gather 需要 indices 维度匹配。
+            # ref_ratios: [B, M] -> gather dim 1 using idx [B, N]
+            
+            # 取出参考比例 x0, x1
+            x0 = torch.gather(ref_ratios, 1, idx_left)   # [B, N]
+            x1 = torch.gather(ref_ratios, 1, idx_right)  # [B, N]
+            if Debug:
+                print(f"[DEBUG] x0:\n{x0}")
+                print(f"[DEBUG] x1:\n{x1}")
+                pdb.set_trace()
+            # 取出参考坐标 y0, y1 [B, M, 2]
+            # 需要把 index 扩展为 [B, N, 2] 以 gather 坐标
+            idx_left_2d = idx_left.unsqueeze(-1).expand(-1, -1, 2)
+            idx_right_2d = idx_right.unsqueeze(-1).expand(-1, -1, 2)
+            if Debug:
+                print(f"[DEBUG] idx_left_2d : {idx_left_2d}")
+                print(f"[DEBUG] idx_right_2d : {idx_right_2d}")
+                pdb.set_trace()
+                
+            y0 = torch.gather(path_pixel_raw_tensor, 1, idx_left_2d)  # [B, N, 2]
+            y1 = torch.gather(path_pixel_raw_tensor, 1, idx_right_2d)  # [B, N, 2]
+            if Debug:
+                print(f"[DEBUG] y0 shape: {y0.shape}, y0:\n{y0}")
+                print(f"[DEBUG] y1 shape: {y1.shape}, y1:\n{y1}")
+                pdb.set_trace()
+            # 3. 计算线性插值权重 alpha
+            # 避免除以 0
+            denom = x1 - x0
+            denom[denom == 0] = 1e-6 
+            alpha = (wp_ratios - x0) / denom        # [B, N]
+            alpha = alpha.unsqueeze(-1)             # [B, N, 1]
+            
+            # 4. 得到引导点 (Guide Points)
+            gt_guide_points = y0 + alpha * (y1 - y0)  # [B, N, 2]
+            
+            # --- D. 计算 Loss ---
+            # 只计算有效点的 Loss
+            # dense_mask True 为无效，需要取反
+            valid_mask_expanded = (~dense_mask).unsqueeze(-1).float()  # [B, N, 1]
+            
+            # 计算每点的 MSE
+            se_per_point = (waypoints - gt_guide_points) ** 2  # [B, N, 2]
+            
+            # Mask 掉无效点并求和
+            masked_se = se_per_point * valid_mask_expanded
+            sum_se = torch.sum(masked_se)
+            if Debug:
+                print(f"[DEBUG] gt_guide_points shape: {gt_guide_points.shape}, gt_guide_points:\n{gt_guide_points}")
+                print(f"[DEBUG] se_per_point shape: {se_per_point.shape}, se_per_point:\n{se_per_point}")
+                print(f"[DEBUG] masked_se shape: {masked_se.shape}, masked_se:\n{masked_se}")
+                print(f"[DEBUG] sum_se: {sum_se}")
+                pdb.set_trace()
+            if Debug:
+                vis_idx = 0
+                cmap = batch_maps[vis_idx, 0].detach().cpu().numpy()
+                wp = waypoints[vis_idx].detach().cpu().numpy()
+                gp = gt_guide_points[vis_idx].detach().cpu().numpy()
+
+                if dense_mask is not None:
+                    valid_len = int(valid_dense_len[vis_idx].item())
+                    wp = wp[:valid_len]
+                    gp = gp[:valid_len]
+
+                H, W = cmap.shape
+                center_row = H / 2.0
+                center_col = W / 2.0
+                res = 0.1
+
+                def to_pixel(points):
+                    rows = center_row - points[:, 0] / res
+                    cols = center_col - points[:, 1] / res
+                    return rows, cols
+
+                wp_r, wp_c = to_pixel(wp)
+                gp_r, gp_c = to_pixel(gp)
+
+                plt.figure(figsize=(6, 6))
+                plt.imshow(cmap, cmap="jet", origin="upper", extent=[0, W, H, 0])
+                plt.plot(wp_c, wp_r, "w.-", linewidth=1.5, markersize=3, label="Waypoints")
+                plt.plot(gp_c, gp_r, "m.-", linewidth=1.5, markersize=3, label="Guide Points")
+                plt.legend(loc="upper right", fontsize="small")
+                plt.tight_layout()
+                plt.show(block=True)
+                plt.close()
+                    
+            # 除以总有效点数 (2 是 x, y 两个维度)
+            total_valid_elements = torch.sum(valid_dense_len) * 2
+            loss_guide = sum_se / (total_valid_elements + 1e-6)
 
         # Total Loss
-        trajectory_loss = self.w_obs * oloss + self.w_goal * gloss + self.w_motion * mloss
+        trajectory_loss = self.w_obs * oloss + self.w_goal * gloss + self.w_motion * mloss + self.w_guide * loss_guide
 
         # ============================================================
         # 5. Fear Loss (只看有效区域)
@@ -401,7 +538,8 @@ class BatchTrajCost(TrajCost):
             pdb.set_trace()
         fear_loss = torch.nn.BCELoss()(fear, is_collision)
 
-        return trajectory_loss + 0.1 * fear_loss, trajectory_loss, fear_loss
+        return trajectory_loss + 0.1 * fear_loss, trajectory_loss, self.w_motion * mloss, fear_loss
+    
     def _compute_oloss_batch(self, waypoints, batch_maps):
         B, N, _ = waypoints.shape
         H, W = batch_maps.shape[2], batch_maps.shape[3]
@@ -504,27 +642,49 @@ class MapProcessor:
         
         for i in range(batch_size):
             grid = raw_maps_numpy[i]
-            
-            # 1. 反转 (1=Obs, 0=Free)
             binary_obs = (grid == 0).astype(np.float32)
-            binary_free = (grid == 1).astype(np.float32)
-            
-            # 2. 距离变换
-            dist = ndimage.distance_transform_edt(binary_free)
-            dist_metric = dist * self.res
-            
-            # 3. 指数衰减 Cost = exp(-2.0 * dist)
-            cost = np.exp(-3.0 * dist_metric)
-            cost[binary_obs == 1] = 1.0  # 强制障碍物
-            
-            # 4. 平滑
-            cost = gaussian_filter(cost, sigma=self.sigma)
-            cost = np.clip(cost, 0.0, 1.0)
-            
-            out_maps.append(cost)
-            
+            dist_to_obs = ndimage.distance_transform_edt(1 - binary_obs) * self.res
+            cost_free = np.exp(-3.0 * dist_to_obs) # 衰减系数可调，2.0比3.0更平缓，梯度传得更远
+            dist_inside = ndimage.distance_transform_edt(binary_obs) * self.res
+            cost_obs = 1.0 + 2.0 * dist_inside
+            final_cost = np.where(binary_obs == 1, cost_obs, cost_free)
+            final_cost = gaussian_filter(final_cost, sigma=1.0)
+            out_maps.append(final_cost)
         return np.array(out_maps)[:, np.newaxis, :, :] # [B, 1, H, W]
 
+    def collided_count(self, waypoints, cost_maps, threshold=0.8):
+        """
+        计算轨迹中碰撞点的数量 (Cost > threshold)
+        waypoints: [B, N, 2]
+        cost_maps: [B, 1, H, W]
+        """
+        B, N, _ = waypoints.shape
+        H, W = cost_maps.shape[2], cost_maps.shape[3]
+        
+        # 物理坐标 -> 像素坐标
+        res = 0.1
+        center_row = H / 2.0
+        center_col = W / 2.0
+        
+        px = waypoints[..., 0]  # x (meters)
+        py = waypoints[..., 1]  # y (meters)
+        
+        row_idx = (center_row - px / res).long()
+        col_idx = (center_col - py / res).long()
+        
+        # Clamp to valid range
+        row_idx = torch.clamp(row_idx, 0, H - 1)
+        col_idx = torch.clamp(col_idx, 0, W - 1)
+        
+        # Gather cost values
+        batch_indices = torch.arange(B, device=waypoints.device).unsqueeze(1).expand(-1, N) # [B, N]
+        cost_values = cost_maps[batch_indices, 0, row_idx, col_idx] # [B, N]
+        
+        # Count collisions
+        collided_points = (cost_values > threshold).float()
+        collision_count = collided_points.sum(dim=1) # [B]
+        
+        return collision_count
 
 # ==========================================
 # 4. 主训练流程
@@ -582,17 +742,66 @@ def align_map_size(map_tensor, target_size=(80, 80)):
         )
     return map_tensor
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local_rank", type=int, default=-1) # DDP 自动传入
+    return parser.parse_args()
+
+def worker_init_fn(worker_id):
+    # 确保每个 worker 的 numpy 随机种子不同
+    # 结合: 当前随机种子 + worker ID
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed + worker_id)
+
 def train_pipeline():
     # 1. 初始化配置
+    
+    # --- 封装 DataLoader 创建逻辑 ---
+    def build_dataloader(dataset, mode='train'):
+        sampler = DistributedSampler(dataset, shuffle=(mode=='train'))
+        loader = DataLoader(
+            dataset,
+            batch_size=cfg.batch_size,
+            shuffle=False, # DDP 下必须为 False
+            sampler=sampler,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            worker_init_fn=worker_init_fn
+        )
+        return loader, sampler
+    
+    args = parse_args()
+    
+    # 2. 初始化 DDP 环境
+    if torch.cuda.is_available():
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+
     cfg = Config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
+
+    # 仅在主进程打印 Log
+    if local_rank == 0:
+        print(f"[INFO] DDP Initialized. Using device: {device}")
+        os.makedirs(cfg.save_dir, exist_ok=True)
+        os.makedirs(cfg.log_dir, exist_ok=True)
+        if os.path.exists(cfg.log_dir + '/tb'):
+            shutil.rmtree(cfg.log_dir + '/tb')
+        writer = SummaryWriter(log_dir=cfg.log_dir + '/tb')
     
-    os.makedirs(cfg.save_dir, exist_ok=True)
-    os.makedirs(cfg.log_dir, exist_ok=True)
-    if os.path.exists(cfg.log_dir + '/tb'):
-        shutil.rmtree(cfg.log_dir + '/tb')
-    writer = SummaryWriter(log_dir=cfg.log_dir + '/tb')
+    stage_goals = {
+        0: {'target_loss': 0.28, 'collision_rate': 0.1, 'min_epochs': 160},  # Stage 0 只要 Motion Loss 很低
+        1: {'target_loss': 0.25, 'collision_rate': 0.1, 'min_epochs': 120},  # Stage 0 只要 Motion Loss 很低
+        2: {'target_loss': 0.283, 'collision_rate': 0.05, 'min_epochs': 100}, # Stage 1 碰撞率低于 10%
+        3: {'target_loss': 0.28, 'collision_rate': 0.15, 'min_epochs': 100},
+        4: {'target_loss': 0.26, 'collision_rate': 0.12, 'min_epochs': 100},
+        5: {'target_loss': 0.24, 'collision_rate': 0.12, 'min_epochs': 100}
+    }
     
     # --- A. 数据集准备 (使用 Config 参数) ---
     print("[INFO] Loading Dataset...")
@@ -605,13 +814,25 @@ def train_pipeline():
         safe_dist_threshold=2.0,
         config=cfg.train_aug_config  # 传入包含 ghost_prob=0.8 的配置
     )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True
-    )
+    train_loader, train_sampler = build_dataloader(train_dataset, 'train')
+    
+    # train_sampler = DistributedSampler(train_dataset, shuffle=True)
+    # train_loader = DataLoader(
+    #     train_dataset,
+    #     batch_size=cfg.batch_size,  # 注意：这是单卡的 batch_size，总 batch = batch_size * GPU数
+    #     shuffle=False,             # DDP下必须 False，由 sampler 控制
+    #     sampler=train_sampler,     # 传入 sampler
+    #     num_workers=cfg.num_workers,
+    #     pin_memory=True,
+    #     worker_init_fn=worker_init_fn  # <--- 添加这一行
+    # )
+    # train_loader = DataLoader(
+    #     train_dataset,
+    #     batch_size=cfg.batch_size,
+    #     shuffle=True,
+    #     num_workers=cfg.num_workers,
+    #     pin_memory=True
+    # )
     
     # 验证集
     val_dataset = CollectData(
@@ -621,15 +842,49 @@ def train_pipeline():
         safe_dist_threshold=2.0,
         config=cfg.val_aug_config
     )
-    val_loader = DataLoader(val_dataset, batch_size=cfg.batch_size, shuffle=False)
+    val_loader, val_sampler = build_dataloader(val_dataset, 'val')
+    # val_sampler = DistributedSampler(val_dataset, shuffle=False)
+    # val_loader = DataLoader(
+    #     val_dataset,
+    #     batch_size=cfg.batch_size,
+    #     shuffle=False,
+    #     sampler=val_sampler,
+    #     num_workers=cfg.num_workers,
+    #     pin_memory=True,
+    #     worker_init_fn=worker_init_fn  # <--- 添加这一行
+    # )
     print(f"[INFO] Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
     # --- B. 模型初始化 ---
+    print("[INFO] Initializing CNN Planner...")
     model = AutoEncoderGrid(
         encoder_channel=64, 
         max_dist=cfg.max_dist, 
         step_size=cfg.step_size  # 保留您的设定 0.3
     ).to(device)
+    global USING_transformer
+    if USING_transformer:
+        # === 修改为 Transformer ===
+        print("[INFO] Initializing Transformer Planner...")
+        model = TransformerPlanner(
+            encoder_channel=512, # PlannerNetGrid 的输出通道
+            d_model=512,         # 保持一致效率最高
+            nhead=8,             # 8头注意力
+            num_layers=4,        # 4层 Transformer Encoder (对于80x80地图足够了)
+            max_dist=cfg.max_dist,
+            step_size=cfg.step_size
+        ).to(device)
+    else:
+        # === 保持原有 CNN 结构 ===
+        print("[INFO] Initializing CNN Planner...")
+        model = AutoEncoderGrid(
+            encoder_channel=64, 
+            max_dist=cfg.max_dist, 
+            step_size=cfg.step_size  # 保留您的设定 0.3
+        ).to(device)
+    
+    model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     
@@ -644,6 +899,7 @@ def train_pipeline():
         w_obs=cfg.w_obs,
         w_motion=cfg.w_motion,
         w_goal=cfg.w_goal,
+        w_guide=cfg.w_guide,
         obstalce_thread=cfg.fear_ahead_dist
     )
     map_proc = MapProcessor()
@@ -652,26 +908,18 @@ def train_pipeline():
     print("[INFO] Start Training Loop...")
     best_val_loss = float('inf')
     
+    curr_stage = 0
+    train_dataset.set_stage(curr_stage)
+    val_dataset.set_stage(curr_stage)  # 验证集也要同步！
+    
     for epoch in range(cfg.epochs):
+        train_sampler.set_epoch(epoch)
         start_time = time.time()
         model.train()
         train_loss_total = 0.0
         
-        # 1. 课程学习更新
-        probs = get_curriculum_probs(epoch, max_warmup_epoch=int(0.8 * cfg.epochs))
-        
-        # 打印当前概率 (可选，方便观察)
-        if epoch % 2 == 0:
-            print(f"[Curriculum] Ep {epoch}: "
-                  f"Step1={probs['step1']:.2f}, Step3={probs['step3']:.2f}, "
-                  f"Far={probs['p_far']:.2f}")
-
-        # 更新数据集策略
-        train_dataset.update_curriculum(epoch, probs)
-        val_dataset.update_curriculum(epoch, probs)
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.epochs}")
-        for batch_idx, (map_tensor, goal_tensor) in enumerate(pbar):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg.epochs}, Stage {curr_stage}")
+        for batch_idx, (map_tensor, goal_tensor, dist_tensor, path_pixel_raw_tensor, path_dist_tensor) in enumerate(pbar):
             # map_tensor: [B, 1, 80, 80] (1=Free)
             global Debug
             if Debug:
@@ -796,7 +1044,6 @@ def train_pipeline():
                     plt.show(block=True)
                     plt.close()
                 
-            
             # 补齐维度 [B, 3] 如果需要 theta，否则保持 [B, 2]
             # 如果你的模型需要 3维 goal (x, y, theta)，请确保维度匹配
             if goal_meters.shape[1] == 2 and net_input.ndim > 0:
@@ -908,7 +1155,7 @@ def train_pipeline():
                     plt.close()
                     
             # --- 诊断日志：有效长度与终点距离 ---
-            if batch_idx % 20 == 0:
+            if batch_idx % 50 == 0:
                 with torch.no_grad():
                     if mask is not None:
                         valid_key_cnt = (~mask).sum(dim=1).float()
@@ -932,20 +1179,23 @@ def train_pipeline():
                         end_pts = waypoints[:, -1, :]
 
                     end_dist = torch.norm(goal_meters - end_pts, dim=1)
-                    print(
-                        f"[Diag] ep{epoch} b{batch_idx} "
-                        f"key_cnt={valid_key_cnt.mean().item():.2f} "
-                        f"dense_len={valid_dense_len.float().mean().item():.1f} "
-                        f"end_dist={end_dist.mean().item():.2f}"
-                    )
-                    writer.add_scalar(
-                        "Diag/EndDist",
-                        end_dist.mean().item(),
-                        epoch * len(train_loader) + batch_idx,
-                    )
+                    
+                    if local_rank == 0:
+                        print(
+                            f"[Diag] ep{epoch} b{batch_idx} "
+                            f"key_cnt={valid_key_cnt.mean().item():.2f} "
+                            f"dense_len={valid_dense_len.float().mean().item():.1f} "
+                            f"end_dist={end_dist.mean().item():.2f}"
+                        )
+                        writer.add_scalar(
+                            "Diag/EndDist",
+                            end_dist.mean().item(),
+                            epoch * len(train_loader) + batch_idx,
+                        )
             
+            # 注意，这里忽略的scale,其实实际存储的地图是81*81,但是后面统一resize成80,在求距离时，并没有更改，但是缩放比例接近1：1,这个地方先不改了
             # --- 计算 Loss (Batch) ---
-            loss, l_traj, l_fear = batch_traj_cost.CostofTraj_Batch(
+            loss, l_traj, l_motion, l_fear = batch_traj_cost.CostofTraj_Batch(
                 waypoints=waypoints,
                 goal=goal_meters,
                 fear=pred_fear,
@@ -953,14 +1203,18 @@ def train_pipeline():
                 ahead_dist=cfg.fear_ahead_dist,
                 batch_maps=net_input,  # 传入与网络输入一致的 Batch Map
                 sub_step_size=cfg.sub_step_size,
-                mask=mask
+                mask=mask,
+                distance=dist_tensor.to(device),
+                path_pixel_raw_tensor=path_pixel_raw_tensor.to(device),
+                path_dist_tensor=path_dist_tensor.to(device)
             )
             
             loss.backward()
-            
-            writer.add_scalar('Loss/Train_Total', loss.item(), epoch * len(train_loader) + batch_idx)
-            writer.add_scalar('Loss/Train_Traj', l_traj.item(), epoch * len(train_loader) + batch_idx)
-            writer.add_scalar('Loss/Train_Fear', l_fear.item(), epoch * len(train_loader) + batch_idx)
+            if local_rank == 0:
+                writer.add_scalar('Loss/Train_Total', loss.item(), epoch * len(train_loader) + batch_idx)
+                writer.add_scalar('Loss/Train_Traj', l_traj.item(), epoch * len(train_loader) + batch_idx)
+                writer.add_scalar('Loss/Train_Motion', l_motion.item(), epoch * len(train_loader) + batch_idx)
+                writer.add_scalar('Loss/Train_Fear', l_fear.item(), epoch * len(train_loader) + batch_idx)
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -969,7 +1223,7 @@ def train_pipeline():
             pbar.set_postfix({'loss': loss.item(), 'traj': l_traj.item()})
             
             # 可视化 (每 50 batch 保存一张)
-            if batch_idx % 50 == 0:
+            if batch_idx % 50 == 0 and local_rank == 0:
                 visualize_debug(
                     cost_maps=net_input.detach().cpu().numpy(),
                     waypoints=waypoints,
@@ -980,14 +1234,18 @@ def train_pipeline():
                     idx=batch_idx,
                     save_dir=f"{cfg.log_dir}/train",
                     res=cfg.resolution,
-                    sub_step_size=cfg.sub_step_size  # <--- 新增，确保截断准确
+                    sub_step_size=cfg.sub_step_size,  # <--- 新增，确保截断准确
+                    curr_stage=curr_stage  # <--- 新增，显示当前阶段信息
                 )
 
         # --- E. 验证循环 ---
+        total_samples = 0
+        collided_samples = 0
+        
         model.eval()
         val_loss_total = 0.0
         with torch.no_grad():
-            for batch_idx, (map_tensor, goal_tensor) in enumerate(val_loader):
+            for batch_idx, (map_tensor, goal_tensor, distance_tensor, path_pixel_raw_tensor, path_dist_tensor) in enumerate(val_loader):
                 # 同样的预处理流程
                 raw_np = map_tensor.squeeze(1).numpy()
                 smooth_cost_np = map_proc.process_batch(raw_np)
@@ -1022,19 +1280,27 @@ def train_pipeline():
                     preds, step=cfg.sub_step_size, mask=mask
                 )
                 
-                loss, _, _ = batch_traj_cost.CostofTraj_Batch(
+                # 计算碰撞数量，对于避障很重要
+                collided_count = map_proc.collided_count(waypoints, net_input)
+                collided_samples += (collided_count > 0).sum().item()
+                total_samples += waypoints.shape[0]
+                
+                loss, _, __, ___ = batch_traj_cost.CostofTraj_Batch(
                     waypoints=waypoints,
                     goal=goal_meters,
                     fear=pred_fear,
-                    log_step=0,
+                    log_step=epoch,
                     ahead_dist=cfg.fear_ahead_dist,
                     batch_maps=net_input,
                     sub_step_size=cfg.sub_step_size,
-                    mask=mask
+                    mask=mask,
+                    distance=distance_tensor.to(device),
+                    path_pixel_raw_tensor=path_pixel_raw_tensor.to(device),
+                    path_dist_tensor=path_dist_tensor.to(device)
                 )
                 val_loss_total += loss.item()
                 
-                if batch_idx % 20 == 0:
+                if batch_idx % 100 == 0 and local_rank == 0:
                     visualize_debug(
                         cost_maps=net_input.detach().cpu().numpy(),
                         waypoints=waypoints,
@@ -1045,27 +1311,84 @@ def train_pipeline():
                         idx=0,
                         save_dir=f"{cfg.log_dir}/val",
                         res=cfg.resolution,
-                        sub_step_size=cfg.sub_step_size # <--- 新增
+                        sub_step_size=cfg.sub_step_size,  # <--- 新增
+                        curr_stage=curr_stage  # <--- 新增，显示当前阶段信息
                     )
         
         # --- F. 统计与保存 ---
-        avg_train_loss = train_loss_total / len(train_loader)
-        avg_val_loss = val_loss_total / len(val_loader)
-        writer.add_scalar('Loss/Val_Total', avg_val_loss, epoch)
+        # avg_train_loss = train_loss_total / len(train_loader)
+        # avg_val_loss = val_loss_total / len(val_loader)
+        
+        metrics_tensor = torch.tensor([
+            train_loss_total, 
+            val_loss_total, 
+            collided_samples, 
+            total_samples
+        ], dtype=torch.float32, device=device)
+        
+        dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+        
+        global_train_loss = metrics_tensor[0].item()
+        global_val_loss = metrics_tensor[1].item()
+        global_collided = metrics_tensor[2].item()
+        global_total = metrics_tensor[3].item()
+        
+        world_size = dist.get_world_size()
+        
+        avg_train_loss = global_train_loss / (len(train_loader) * world_size)
+        avg_val_loss = global_val_loss / (len(val_loader) * world_size)
+        val_collision_rate = global_collided / global_total if global_total > 0 else 0.0
+        # [修改点 1]：在所有 Rank 上都计算碰撞率，不要放在 if local_rank == 0 里
+        # 假设 total_samples 和 collided_samples 在之前的步骤中已经做过 all_reduce (汇总) 或者即使是局部的也足以作为判断依据
+        # val_collision_rate = collided_samples / total_samples if total_samples > 0 else 0.0
+    
+        # [修改点 2]：只让 Rank 0 负责打印日志和写 TensorBoard
+        if local_rank == 0:
+            writer.add_scalar('Loss/Val_Total', avg_val_loss, epoch)
+            writer.add_scalar('Metrics/Val_CollisionRate', val_collision_rate, epoch)
+    
+        # [修改点 3]：阶段判断逻辑必须在主干道上（不要缩进到 local_rank==0 里）
+        # 这样所有显卡都会同时切换到下一个 Stage
+        min_total_epochs = sum([stage_goals[s]['min_epochs'] for s in range(curr_stage + 1)])
+
+        if avg_val_loss < stage_goals[curr_stage]['target_loss'] and val_collision_rate < stage_goals[curr_stage]['collision_rate'] and epoch >= min_total_epochs:
+            if local_rank == 0: # 只有 Rank 0 打印文字，避免刷屏
+                print(f">>> Stage {curr_stage} Passed! Moving to next stage.")
+            
+            curr_stage += 1
+            
+            if curr_stage > max(stage_goals.keys()):
+                if local_rank == 0:
+                    print(">>> All stages passed! Training complete.")
+                curr_stage = max(stage_goals.keys())
+            else:
+                # 关键：所有 Rank 都要更新 Dataset
+                train_dataset.set_stage(curr_stage)
+                val_dataset.set_stage(curr_stage)
+                if local_rank == 0:
+                    print(f"[System] DataLoaders rebuilt for Stage {curr_stage}")
+                train_loader, train_sampler = build_dataloader(train_dataset, 'train')
+                val_loader, val_sampler = build_dataloader(val_dataset, 'val')
+                
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = cfg.lr * (0.9 ** curr_stage)
         
         scheduler.step(avg_val_loss)
         
         print(f"Epoch {epoch+1} | Train: {avg_train_loss:.4f} | Val: {avg_val_loss:.4f} | Time: {time.time()-start_time:.1f}s")
         
-        if avg_val_loss < best_val_loss:
+        if local_rank == 0 and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), f"{cfg.save_dir}/best_model.pt")
             print(">>> Best Model Saved!")
             
         if (epoch + 1) % 50 == 0:
              torch.save(model.state_dict(), f"{cfg.save_dir}/epoch_{epoch+1}.pt")
-
-def visualize_debug(cost_maps, waypoints, preds, mask, goals, epoch, idx, save_dir, res=0.1, sub_step_size=0.2):
+    if local_rank == 0:
+        writer.close()
+    
+    dist.destroy_process_group()
+def visualize_debug(cost_maps, waypoints, preds, mask, goals, epoch, idx, save_dir, res=0.1, sub_step_size=0.2, curr_stage=0):
     """
     Args:
         cost_maps: Numpy [B, 1, H, W] or [B, H, W] -> Cost Map
@@ -1152,7 +1475,7 @@ def visualize_debug(cost_maps, waypoints, preds, mask, goals, epoch, idx, save_d
     plt.tight_layout()
     
     # 保存
-    plt.savefig(f"{save_dir}/debug_{epoch}_{idx}.png", dpi=100)
+    plt.savefig(f"{save_dir}/debug_{curr_stage}_{epoch}_{idx}.png", dpi=100)
     plt.close()
 
 if __name__ == "__main__":

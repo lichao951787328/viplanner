@@ -97,6 +97,7 @@ class TrajCost:
         w_obs: float = 0.25,
         w_motion: float = 1.5,
         w_goal: float = 2.0,
+        w_guide: float = 1.0,
         obstalce_thread: float = 0.75,
         robot_width: float = 0.6,
         robot_max_moving_distance: float = 0.15,
@@ -112,7 +113,7 @@ class TrajCost:
         self.w_obs = w_obs  # 障碍物代价权重
         self.w_motion = w_motion  # 运动平滑代价权重
         self.w_goal = w_goal  # 目标距离代价权重
-
+        self.w_guide = w_guide  # 引导点代价权重 (新添加)
         # fear label threshold value
         self.obstalce_thread = obstalce_thread
 

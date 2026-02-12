@@ -2,7 +2,7 @@
 Author: lichao951787328 951787328@qq.com
 Date: 2026-02-03 13:44:15
 LastEditors: lichao951787328 951787328@qq.com
-LastEditTime: 2026-02-06 15:35:19
+LastEditTime: 2026-02-12 17:02:50
 FilePath: /viplanner/viplanner/utils/trainer_dataset.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -47,6 +47,12 @@ from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import Dataset
 
+# import shutil
+# import matplotlib.pyplot as plt    
+from torch.utils.data import DataLoader
+import heapq
+# from viplanner.plannernet.autoencoder_myself_cubic_dj import _compute_geodesic_distance
+
 
 class CollectData(Dataset):
     # 
@@ -63,7 +69,7 @@ class CollectData(Dataset):
         """
         self.mode = mode
         self.root_path = Path(root_dir)
-        
+        self.debug = True  # 打开调试模式，输出更多信息
         # --- 1. 配置参数 (保持原有的增强配置) ---
         self.cfg = config if config is not None else {
             "enable_map_noise": True,
@@ -73,6 +79,10 @@ class CollectData(Dataset):
             "blur_prob": 0.8           # 模糊概率
         }
 
+        # 【新增】必须加这一行！防止 DDP 卡死
+        cv2.setNumThreads(0) 
+        cv2.ocl.setUseOpenCL(False)
+
         # --- 2. 课程学习状态 ---
         # 默认从最简单的阶段开始
         self.current_epoch = 0
@@ -80,7 +90,7 @@ class CollectData(Dataset):
             'step1': 1.0, 'step2': 0.0, 'step3': 0.0, # 任务阶段概率
             'p_near': 0.9, 'p_far': 0.1               # 距离概率
         }
-
+        self.stage = 0  # 课程学习阶段，控制数据生成的难度和类型
         self.maps = []         # 存储地图图像
         self.map_indices = []  # 存储预计算的索引
 
@@ -165,6 +175,19 @@ class CollectData(Dataset):
             # 数量少，只为了快速看指标
             return int(len(self.maps))  # 或者直接 return len(self.maps)
 
+    # 使用stage来强制性地控制数据生成的流程，确保训练和验证阶段使用不同的数据生成逻辑
+    
+    def set_stage(self, stage):
+        self.stage = stage
+        print(f"[Dataset] Switched to Stage {stage}")
+        
+    # 课程学习逻辑：根据当前阶段(stage)来调整数据生成的方式和难度
+    # 第一阶段：原始图像大量，偶尔随机生成随机噪点，保证模型先学会基本的路径规划，只进行短距离终点的训练，保证模型学会近距离规划。原始图像占比0.8，随机噪点占比0.2，近距离终点占比0.7，远距离终点占比0.3
+    # 第二阶段：原始图像大量，偶尔随机生成随机噪点，保证模型先学会基本的路径规划，增加长距离终点的比例，保证模型学会长距离规划。原始图像占比0.3,随机噪点占比0.7，近距离终点占比0.2，远距离终点占比0.8
+    # 第三阶段：增加少量、面积小的障碍，但不覆盖起点与终点的连线，实现机器人能避障。原始图像占比0.2,随机噪点占比0.8，近距离终点占比0.2，远距离终点占比0.8。独立分布障碍，障碍占比0.3, 非障碍占比0.7
+    # 第四阶段：增加少量、面积小的障碍，部分覆盖起点与终点的连线，实现机器人能避障并且不完全依赖于起点与终点的连线。原始图像占比0.2,随机噪点占比0.8，近距离终点占比0.2，远距离终点占比0.8。独立分布障碍，障碍占比0.8, 非障碍占比0.2
+    # 第五阶段：增加少量、面积大的障碍，部分覆盖起点与终点的连线，实现机器人能避障并且不完全依赖于起点与终点的连线。原始图像占比0.2,随机噪点占比0.8，近距离终点占比0.2，远距离终点占比0.8。独立分布障碍，大障碍占比0.2, 小障碍占比0.6, 非障碍占比0.2
+    # 第六阶段：增加大量、面积大的障碍，部分覆盖起点与终点的连线，实现机器人能避障并且不完全依赖于起点与终点的连线。原始图像占比0.2,随机噪点占比0.8，近距离终点占比0.2，远距离终点占比0.8。独立分布障碍，大障碍占比0.4, 小障碍占比0.4, 非障碍占比0.2
     def __getitem__(self, index):
         # 1. 基础数据获取
         # 验证集如果想要固定结果，可以在这里 seed(index)，但通常为了测试泛化，也可以保持随机
@@ -182,46 +205,448 @@ class CollectData(Dataset):
 
         # 3. 采样终点 (使用之前优化过的逻辑)
         # 注意，此处返回的是像素/栅格坐标，不是实际的米坐标
-        goal_pos = self._sample_goal_optimized(map_meta)
         
+        obstacle_map = base_map.copy()  # 用于后续添加障碍物
         # 4. 课程学习：生成障碍物
-        # 这里的逻辑和训练一模一样，只是验证集数量少
-        rand_step = np.random.rand()
-        final_map = base_map.copy()
-
-        if rand_step < self.probs['step1']:
-            pass
-        elif rand_step < self.probs['step1'] + self.probs['step2']:
-            final_map = self._add_obstacles(base_map, start_pos, goal_pos, density='low', targeted=False)
-        else:
-            final_map = self._add_obstacles(base_map, start_pos, goal_pos, density='high', targeted=True)
-
-        # 5. 图像增强 (通常验证集不加噪声，或者加少量噪声，取决于你想测什么)
-        # 如果你想测“模型在真实噪声下的表现”，则 mode=='val' 也可以为 True
-        # 这里默认：训练加噪，验证保持干净以便观察路径规划逻辑
-        if self.mode == 'train':
-            final_map = self._augment_map(final_map)
-
+        # 第一阶段：原始图像大量，偶尔随机生成随机噪点，保证模型先学会基本的路径规划，只进行短距离终点的训练，保证模型学会近距离规划。原始图像占比0.8，随机噪点占比0.2，近距离终点占比0.7，远距离终点占比0.3
+        if self.stage == 0:
+            goal_pos = self._sample_goal_optimized(map_meta, 0.3)
+            random_noise = np.random.rand()
+            if random_noise < 0:  # 20% 的概率添加随机噪声
+                augment_map = self._augment_map(base_map)
+                if self._is_reachable(augment_map, start_pos, goal_pos):
+                    base_map = augment_map
+            else:
+                base_map = base_map
+                # 检查起点和终点的连线是否穿过障碍
+            # line_mask = np.zeros_like(base_map, dtype=np.uint8)
+            # cv2.line(line_mask, start_pos, goal_pos, 1, 1)
+            # if np.any((line_mask == 1) & (base_map == 0)):
+            #     base_map = np.ones_like(base_map, dtype=base_map.dtype)
+            cv2.line(base_map, tuple(map(int, start_pos)), tuple(map(int, goal_pos)), color=1, thickness=8)  # 8像素宽，保证不仅能过，还能舒服地过
+        # 第二阶段：原始图像大量，偶尔随机生成随机噪点，保证模型先学会基本的路径规划，增加长距离终点的比例，保证模型学会长距离规划。原始图像占比0.3,随机噪点占比0.7，近距离终点占比0.2，远距离终点占比0.8
+        elif self.stage == 1:
+            goal_pos = self._sample_goal_optimized(map_meta, 0.8)
+            random_noise = np.random.rand()
+            if random_noise < 0.5: # 70% 的概率添加随机噪声
+                augment_map = self._augment_map(base_map)
+                if self._is_reachable(augment_map, start_pos, goal_pos):
+                    base_map = augment_map
+            else:
+                base_map = base_map
+            # 检查连线是否被阻断
+            line_check = np.zeros_like(base_map)
+            cv2.line(line_check, tuple(map(int, start_pos)), tuple(map(int, goal_pos)), 1, 1)
+            is_blocked = np.any((base_map < 0.5) & (line_check > 0.5))
+            # 如果被堵住了，有 80% 的概率把路打通（挖洞），20% 留着作为“困难样本”
+            if is_blocked and np.random.rand() < 0.8:
+                cv2.line(base_map, tuple(map(int, start_pos)), tuple(map(int, goal_pos)), color=1, thickness=5)
+        # 第三阶段：增加少量、面积小的障碍，但不覆盖起点与终点的连线，实现机器人能避障。原始图像占比0.2,随机噪点占比0.8，近距离终点占比0.2，远距离终点占比0.8。独立分布障碍，障碍占比0.3, 非障碍占比0.7
+        elif self.stage == 2:
+            goal_pos = self._sample_goal_optimized(map_meta, 0.8)
+            random_noise = np.random.rand()
+            if random_noise < 0.8: # 80% 的概率添加随机噪声
+                augment_map = self._augment_map(base_map)
+                if self._is_reachable(augment_map, start_pos, goal_pos):
+                    base_map = augment_map
+            else:
+                base_map = base_map
+            random_obstacle = np.random.rand()
+            if random_obstacle < 0.3: # 30% 的概率添加随机障碍物
+                obstacle_map = self._add_obstacles(base_map, start_pos, goal_pos, density='low', targeted=False)
+        # 第四阶段：增加少量、面积小的障碍，部分覆盖起点与终点的连线，实现机器人能避障并且不完全依赖于起点与终点的连线。原始图像占比0.2,随机噪点占比0.8，近距离终点占比0.2，远距离终点占比0.8。独立分布障碍，障碍占比0.8, 非障碍占比0.2
+        elif self.stage == 3:
+            goal_pos = self._sample_goal_optimized(map_meta, 0.8)
+            random_noise = np.random.rand()
+            if random_noise < 0.8: # 80% 的概率添加随机噪声
+                augment_map = self._augment_map(base_map)
+                if self._is_reachable(augment_map, start_pos, goal_pos):
+                    base_map = augment_map
+            else:
+                base_map = base_map
+            random_obstacle = np.random.rand()
+            if random_obstacle < 0.8: # 80% 的概率添加随机障碍物
+                obstacle_map = self._add_obstacles(base_map, start_pos, goal_pos, density='low', targeted=True)
+        # 第五阶段：增加少量、面积大的障碍，部分覆盖起点与终点的连线，实现机器人能避障并且不完全依赖于起点与终点的连线。原始图像占比0.2,随机噪点占比0.8，近距离终点占比0.2，远距离终点占比0.8。独立分布障碍，大障碍占比0.2, 小障碍占比0.6, 非障碍占比0.2
+        elif self.stage == 4:
+            goal_pos = self._sample_goal_optimized(map_meta, 0.8)
+            random_noise = np.random.rand()
+            if random_noise < 0.8:  # 80% 的概率添加随机噪声
+                augment_map = self._augment_map(base_map)
+                if self._is_reachable(augment_map, start_pos, goal_pos):
+                    base_map = augment_map
+            else:
+                base_map = base_map
+            random_obstacle = np.random.rand()
+            if random_obstacle < 0.8:  # 80% 的概率添加随机障碍物
+                density_choice = 'high' if np.random.rand() < 0.2 else 'low'
+                targeted_choice = True if np.random.rand() < 0.4 else False
+                obstacle_map = self._add_obstacles(base_map, start_pos, goal_pos, density=density_choice, targeted=targeted_choice)
+        # 第六阶段：增加大量、面积大的障碍，部分覆盖起点与终点的连线，实现机器人能避障并且不完全依赖于起点与终点的连线。原始图像占比0.2,随机噪点占比0.8，近距离终点占比0.2，远距离终点占比0.8。独立分布障碍，大障碍占比0.4, 小障碍占比0.4, 非障碍占比0.2
+        elif self.stage == 5:
+            goal_pos = self._sample_goal_optimized(map_meta, 0.8)
+            random_noise = np.random.rand()
+            if random_noise < 0.8:  # 80% 的概率添加随机噪声
+                augment_map = self._augment_map(base_map)
+                if self._is_reachable(augment_map, start_pos, goal_pos):
+                    base_map = augment_map
+            else:
+                base_map = base_map
+            random_obstacle = np.random.rand()
+            if random_obstacle < 0.8:  # 80% 的概率添加随机障碍物
+                density_choice = 'high' if np.random.rand() < 0.4 else 'low'
+                targeted_choice = True if np.random.rand() < 0.8 else False
+                obstacle_map = self._add_obstacles(base_map, start_pos, goal_pos, density=density_choice, targeted=targeted_choice)
         # 6. 格式转换
         # map_tensor = torch.from_numpy(final_map).unsqueeze(0)
-        map_tensor = torch.from_numpy(final_map).float().unsqueeze(0)
+        map_tensor = torch.from_numpy(base_map).float().unsqueeze(0)
         goal_tensor = torch.tensor(goal_pos, dtype=torch.float32)
 
         # 连通性检查失败回退
-        if not self._is_reachable(final_map, start_pos, goal_pos):
-            final_map = base_map
-            map_tensor = torch.from_numpy(final_map).float().unsqueeze(0)
-        return map_tensor, goal_tensor
+        # 把_is_reachable返回路径长度和路径，由于要使用路径点作引导，那就需要需要路径点的个数，这需要考虑与model推出的路径点是一致的
+        if self._is_reachable(obstacle_map, start_pos, goal_pos):
+            base_map = obstacle_map
+        else:
+            base_map = base_map  # 不添加障碍物，保持原图
+        # 6. 计算实际路程 (米)
+        # 传入当前的最终地图、起点、终点
+        # 这个地方暂时不用这么精确的计算，直接改成欧式距离
+        path_length_m = np.linalg.norm(np.array(goal_pos) - np.array(start_pos)) * 0.1  # 要乘分辨率
+        
+        path_pixel_raw, path_dist, _ = self._generate_raw_astar_path(base_map, start_pos, goal_pos)
+        
+        # path_length_m = self._compute_path_length(base_map, start_pos, goal_pos)
+        # path_length_m = _compute_geodesic_distance(base_map, start_pos, goal_pos)  # 使用地理距离计算
+        # # 计算需要的点数 (添加 10% 的余量)
+        # num_valid_points = torch.ceil((path_length_m / self.step_size) * 1.1).long()
+        # # 截断到 max_k
+        # num_valid_points = num_valid_points.clamp(min=1, max=self.max_k)
+        
+        # 使用_compute_geodesic_distance
+        
+        # 7. 转换为 Tensor
+        map_tensor = torch.from_numpy(base_map).float().unsqueeze(0)  # [1, H, W]
+        goal_tensor = torch.tensor(goal_pos, dtype=torch.float32)    # [2]
+        dist_tensor = torch.tensor(path_length_m, dtype=torch.float32)  # [1] (标量)
+        path_pixel_raw_tensor = torch.tensor(path_pixel_raw, dtype=torch.float32)  # [N, 2]
+        path_dist_tensor = torch.tensor(path_dist, dtype=torch.float32)  # [N] (标量)
+        return map_tensor, goal_tensor, dist_tensor, path_pixel_raw_tensor, path_dist_tensor
 
+    # # 这个要返回路径，构造一个可行的路径，作为规划的引导
+    # def _compute_geodesic_distance(self, map_tensor, goals):
+    #     """
+    #     计算从地图中心到目标的实际避障距离
+    #     """
+    #     batch_size = map_tensor.shape[0]
+    #     distances = []
+        
+    #     # 转 CPU numpy
+    #     maps_np = map_tensor.squeeze(1).detach().cpu().numpy()
+    #     goals_np = goals.detach().cpu().numpy()
+        
+    #     # 地图中心索引 (假设机器人总是在中心)
+    #     center_idx = (self.map_size // 2, self.map_size // 2)
+
+    #     for i in range(batch_size):
+    #         grid = maps_np[i]  # 80x80
+    #         g_x, g_y = goals_np[i]  # meters
+            
+    #         # 计算像素坐标
+    #         row_idx = int(round(center_idx[0] - (g_x / self.map_res)))
+    #         col_idx = int(round(center_idx[1] - (g_y / self.map_res)))
+    #         raw_target = (row_idx, col_idx)
+    #         target_node = (np.clip(row_idx, 0, self.map_size - 1),
+    #                        np.clip(col_idx, 0, self.map_size - 1))
+
+    #         # 欧氏距离 (保底用)
+    #         euclidean = np.linalg.norm([g_x, g_y])
+            
+    #         if not (0 <= raw_target[0] < self.map_size and 0 <= raw_target[1] < self.map_size):
+    #             distances.append(euclidean)
+    #             continue
+
+    #         # 构建 Cost Grid (0=空, 1=障碍)
+    #         # 假设输入 map_tensor 中 1 是障碍，0 是空
+    #         # skimage 需要: 1=通行代价低, 1000=通行代价高
+    #         cost_grid = np.ones_like(grid)
+    #         # 稍微膨胀一下障碍物判定阈值
+    #         cost_grid[grid > 0.5] = 1000.0 
+
+    #         try:
+    #             # 检查起点终点是否在障碍物里
+    #             if cost_grid[center_idx] > 100 or cost_grid[target_node] > 100:
+    #                 dist = euclidean * 1.5  # 如果在墙里，给个惩罚
+    #             else:
+    #                 # 计算最小代价路径
+    #                 indices, weight = graph.route_through_array(
+    #                     cost_grid, start=center_idx, end=target_node, 
+    #                     fully_connected=True, geometric=True
+    #                 )
+    #                 # weight 是像素距离，转回米
+    #                 dist = weight * self.map_res
+                    
+    #                 # 如果算出来的距离大得离谱(穿墙了)，回退
+    #                 if dist > self.max_dist * 3:
+    #                     dist = euclidean * 1.5
+    #         except:
+    #             # 寻路失败 (不可达)
+    #             dist = euclidean * 1.5
+            
+    #         distances.append(dist)
+
+    #     return torch.tensor(distances, device=map_tensor.device, dtype=torch.float32)
+
+
+    # def _compute_path_length(self, map_data, start_pos, goal_pos):
+    #     """
+    #     使用 Dijkstra 计算从起点到终点的最短路径长度（单位：米）
+    #     map_data: 0=障碍, 1=可通行
+    #     start_pos: (x, y)
+    #     goal_pos: (x, y)
+    #     """
+    #     h, w = map_data.shape
+    #     # 转为整数坐标 (row, col) -> (y, x)
+    #     start_rc = (int(start_pos[1]), int(start_pos[0]))
+    #     goal_rc = (int(goal_pos[1]), int(goal_pos[0]))
+
+    #     # 1. 边界与障碍物检查
+    #     if not (0 <= start_rc[0] < h and 0 <= start_rc[1] < w): return -1.0
+    #     if not (0 <= goal_rc[0] < h and 0 <= goal_rc[1] < w): return -1.0
+        
+    #     # 注意：这里假设 map_data 中 > 0.5 为可通行区域
+    #     if map_data[start_rc] < 0.5 or map_data[goal_rc] < 0.5:
+    #         return -1.0  # 起点或终点在障碍物内
+
+    #     # 2. Dijkstra 初始化
+    #     # 优先队列: (accumulated_dist, r, c)
+    #     pq = [(0.0, start_rc[0], start_rc[1])]
+    #     visited = set()
+    #     min_dists = {start_rc: 0.0}
+
+    #     # 8-邻域移动代价 (直行1.0，斜行1.414)
+    #     moves = [
+    #         (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),  # 上下左右
+    #         (-1, -1, 1.414), (-1, 1, 1.414), (1, -1, 1.414), (1, 1, 1.414)  # 对角线
+    #     ]
+
+    #     while pq:
+    #         curr_dist, r, c = heapq.heappop(pq)
+
+    #         # 找到终点
+    #         if r == goal_rc[0] and c == goal_rc[1]:
+    #             return curr_dist * 0.1
+    #             # return curr_dist * self.map_resolution  # 转换为实际距离(米)
+
+    #         if (r, c) in visited:
+    #             continue
+    #         visited.add((r, c))
+
+    #         # 遍历邻居
+    #         for dr, dc, cost in moves:
+    #             nr, nc = r + dr, c + dc
+                
+    #             # 检查边界
+    #             if 0 <= nr < h and 0 <= nc < w:
+    #                 # 检查是否是障碍物 (假设 > 0.5 是路)
+    #                 if map_data[nr, nc] > 0.5:
+    #                     new_dist = curr_dist + cost 
+    #                     if new_dist < min_dists.get((nr, nc), float('inf')):
+    #                         min_dists[(nr, nc)] = new_dist
+    #                         heapq.heappush(pq, (new_dist, nr, nc))
+        
+    #     return -1.0  # 无法到达
+    
+    
     # ---------------- 以下辅助函数保持不变 ----------------
     def update_curriculum(self, epoch, new_probs):
         self.current_epoch = epoch
         self.probs = new_probs
 
-    def _sample_goal_optimized(self, map_meta):
-        # 简单的 Near/Far 采样，不涉及 FOV
-        p_far = self.probs.get('p_far', 0.1)
+    # 这个返回的是路径点坐标和对应的累积距离，供 Trainer 中的引导使用
+    def _generate_raw_astar_path(self, map_data, start, goal):
+        """
+        map_data: 2D array
+        start, goal: (x, y)
+        return: padded_raw (200, 2), padded_dist (200,), actual_len (int)
+        """
+        # 1. 调用上面的 A* 计算路径
+        raw_path_list = self._run_astar(map_data, start, goal)
         
+        if self.debug:
+            print(f"[DEBUG] raw_path_list size: {len(raw_path_list)}, start: {start}, goal: {goal}")
+            vis = (map_data * 255).astype(np.uint8)
+            vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+            for i in range(1, len(raw_path_list)):
+                p1 = tuple(map(int, raw_path_list[i - 1]))
+                p2 = tuple(map(int, raw_path_list[i]))
+                cv2.line(vis, p1, p2, (0, 0, 255), 1)
+            cv2.circle(vis, tuple(map(int, start)), 3, (0, 255, 0), -1)
+            cv2.circle(vis, tuple(map(int, goal)), 3, (255, 0, 0), -1)
+            cv2.imshow("Path Visualization", vis)
+            cv2.waitKey(0)
+            
+        map_res = 0.1  # meters per pixel
+        h, w = map_data.shape
+        center_row = (h - 1) / 2.0
+        center_col = (w - 1) / 2.0
+
+        if raw_path_list and len(raw_path_list) >= 3:
+            raw_path_np = np.asarray(raw_path_list, dtype=np.float32)
+            kernel = np.array([1, 2, 3, 2, 1], dtype=np.float32)
+            kernel /= kernel.sum()
+            pad = len(kernel) // 2
+            x = np.pad(raw_path_np[:, 0], (pad, pad), mode="edge")
+            y = np.pad(raw_path_np[:, 1], (pad, pad), mode="edge")
+            smooth_x = np.convolve(x, kernel, mode="valid")
+            smooth_y = np.convolve(y, kernel, mode="valid")
+            raw_path_np = np.stack([smooth_x, smooth_y], axis=1)
+
+            if self.debug:
+                print(f"[DEBUG] Smoothed path size: {raw_path_np.shape}, start: {start}, goal: {goal}")
+                vis = (map_data * 255).astype(np.uint8)
+                vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+                for i in range(1, len(raw_path_np)):
+                    p1 = tuple(map(int, raw_path_np[i - 1]))
+                    p2 = tuple(map(int, raw_path_np[i]))
+                    cv2.line(vis, p1, p2, (0, 0, 255), 1)
+                cv2.circle(vis, tuple(map(int, start)), 3, (0, 255, 0), -1)
+                cv2.circle(vis, tuple(map(int, goal)), 3, (255, 0, 0), -1)
+                cv2.imshow("Smoothed Path Visualization", vis)
+                cv2.waitKey(0)
+            
+            raw_path_m = np.empty_like(raw_path_np)
+            raw_path_m[:, 0] = (center_row - raw_path_np[:, 1]) * map_res
+            raw_path_m[:, 1] = (center_col - raw_path_np[:, 0]) * map_res
+            raw_path_list = raw_path_m.tolist()
+        
+        if self.debug:
+            print(f"[DEBUG] Final raw_path_list size: {len(raw_path_list)}, start: {start}, goal: {goal}")
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(6, 6))
+            h, w = map_data.shape
+            extent = [
+                -center_col * map_res,
+                (w - 1 - center_col) * map_res,
+                (h - 1 - center_row) * map_res,
+                -center_row * map_res
+            ]
+            ax.imshow(map_data, cmap="gray", origin="upper", extent=extent)
+            if raw_path_list:
+                path_np = np.asarray(raw_path_list, dtype=np.float32)
+                ax.plot(path_np[:, 0], path_np[:, 1], color="red", linewidth=2, label="path")
+            ax.scatter([start[0]], [start[1]], color="green", s=40, label="start")
+            ax.scatter([goal[0]], [goal[1]], color="blue", s=40, label="goal")
+            ax.set_xlabel("x (m)")
+            ax.set_ylabel("y (m)")
+            ax.set_title("Map and Path in Physical Coordinates")
+            ax.legend()
+            ax.set_aspect("equal", adjustable="box")
+            plt.show()
+              
+        # 如果没找到路，保底方案：直线连接起点终点
+        if not raw_path_list:
+            raw_path = np.array([start, goal], dtype=np.float32)
+        else:
+            raw_path = np.array(raw_path_list, dtype=np.float32)
+        # 2. 计算每一段的累积路程 (Cumulative Distance)
+        # raw_path shape: [N, 2]
+        if len(raw_path) > 1:
+            # 计算相邻点之间的欧氏距离
+            diffs = np.linalg.norm(raw_path[1:] - raw_path[:-1], axis=1)
+            # 插入 0 作为起点的路程，然后累加
+            cum_dist = np.insert(np.cumsum(diffs), 0, 0.0)
+        else:
+            cum_dist = np.array([0.0], dtype=np.float32)
+        # 3. 填充到固定大尺寸 (200)，用于 Batch 训练
+        max_raw = 200
+        padded_raw = np.zeros((max_raw, 2), dtype=np.float32)
+        padded_dist = np.zeros(max_raw, dtype=np.float32)
+        actual_len = min(len(raw_path), max_raw)
+        # 填充坐标
+        padded_raw[:actual_len] = raw_path[:actual_len]
+        # 填充累积距离
+        padded_dist[:actual_len] = cum_dist[:actual_len]
+        if self.debug:
+            print(f"[DEBUG] Raw path: {raw_path}")
+            print(f"[DEBUG] Cumulative distance: {cum_dist}")
+            print(f"[DEBUG] Padded raw path: {padded_raw}")
+            print(f"[DEBUG] Padded cumulative distance: {padded_dist}")
+        # [关键优化] 对于 Padding 部分，填充最后一个点的坐标和距离
+        # 这样在 Trainer 中插值时，即使超出索引也不会报错
+        if actual_len < max_raw:
+            padded_raw[actual_len:] = raw_path[-1]
+            padded_dist[actual_len:] = cum_dist[-1]
+        if self.debug:
+            print(f"[DEBUG] Final padded raw path: {padded_raw}")
+            print(f"[DEBUG] Final padded cumulative distance: {padded_dist}")
+        return padded_raw, padded_dist, actual_len
+
+    def _run_astar(self, grid, start, goal):
+        """
+        grid: 2D numpy array (1=Free, 0=Obs)
+        start: (x, y) 像素坐标
+        goal: (x, y) 像素坐标
+        返回: [[x1,y1], [x2,y2], ...] 像素坐标列表
+        """
+        kernel_size = 13 
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        
+        # 对白色区域(路)进行腐蚀，黑色区域(障碍)就会变大
+        grid = cv2.erode(grid, kernel)
+        
+        h, w = grid.shape
+        start = (int(start[0]), int(start[1]))
+        goal = (int(goal[0]), int(goal[1]))
+
+        # 检查起点终点是否合法
+        if not (0 <= start[0] < w and 0 <= start[1] < h): return []
+        if not (0 <= goal[0] < w and 0 <= goal[1] < h): return []
+        
+        # 优先队列: (f_score, (x, y))
+        open_list = []
+        heapq.heappush(open_list, (0, start))
+        
+        came_from = {}
+        g_score = {start: 0}
+        
+        # 8 邻域移动方向及代价
+        # (dx, dy, cost)
+        neighbors = [
+            (0, 1, 1), (0, -1, 1), (1, 0, 1), (-1, 0, 1),  # 上下左右
+            (1, 1, 1.414), (1, -1, 1.414), (-1, 1, 1.414), (-1, -1, 1.414)  # 对角线
+        ]
+
+        while open_list:
+            _, current = heapq.heappop(open_list)
+
+            if current == goal:
+                # 重建路径
+                path = []
+                while current in came_from:
+                    path.append(list(current))
+                    current = came_from[current]
+                path.append(list(start))
+                return path[::-1] # 返回从起点到终点的顺序
+
+            for dx, dy, step_cost in neighbors:
+                neighbor = (current[0] + dx, current[1] + dy)
+                
+                # 边界检查
+                if 0 <= neighbor[0] < w and 0 <= neighbor[1] < h:
+                    # 障碍物检查 (grid[y, x])
+                    if grid[neighbor[1], neighbor[0]] > 0.5: # 认为是可通行的
+                        tentative_g_score = g_score[current] + step_cost
+                        
+                        if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                            came_from[neighbor] = current
+                            g_score[neighbor] = tentative_g_score
+                            # f = g + h (使用欧氏距离作为启发式函数)
+                            f_score = tentative_g_score + ((neighbor[0] - goal[0])**2 + (neighbor[1] - goal[1])**2)**0.5
+                            heapq.heappush(open_list, (f_score, neighbor))
+        return [] # 寻路失败
+
+    def _sample_goal_optimized(self, map_meta, p_far):
+        # 简单的 Near/Far 采样，不涉及 FOV        
         target_pool = map_meta['near']
         # 如果随机到远距离，且远距离有空地
         if len(map_meta['far']) > 0 and np.random.rand() < p_far:
@@ -259,7 +684,7 @@ class CollectData(Dataset):
             is_blocking = targeted and (added_count < target_num_obs * 0.5)
             
             if is_blocking:
-                t = np.random.uniform(0.2, 0.8) # 0.2-0.8 避开两端，减少碰撞概率
+                t = np.random.uniform(0.2, 0.8)  # 0.2-0.8 避开两端，减少碰撞概率
                 center_x = start[0] + t * (goal[0] - start[0])
                 center_y = start[1] + t * (goal[1] - start[1])
                 jitter = min(w, h) * 0.1
@@ -345,7 +770,7 @@ class CollectData(Dataset):
         # --- 新增步骤：障碍物膨胀 (即：自由区域腐蚀) ---
         # 目的：确保路径有一定宽度，不是紧贴墙壁的
         # 膨胀半径 3 像素 -> 核大小 = 2*3 + 1 = 7
-        kernel_size = 7 
+        kernel_size = 13 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         
         # 对白色区域(路)进行腐蚀，黑色区域(障碍)就会变大
@@ -471,9 +896,7 @@ class CollectData(Dataset):
         return (augmented_map > 0.5).astype(np.float32)
 
 
-# import shutil
-# import matplotlib.pyplot as plt    
-from torch.utils.data import DataLoader
+
 
 
 def test_standard_dataloader_flow():
