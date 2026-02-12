@@ -1,6 +1,11 @@
 # model files
 ros/planner/models/*
-rotated_out/
+rotated_out/checkpoints_v2
+rotated_out/logs_v2
+rotated_out/logs_v2-0209-01
+rotated_out/logs_v2-0210-01
+rotated_out/logs_v2-0211-01
+rotated_out/logs_v2-0910-02
 viplanner_debug/
 #internal files
 */intern/*
