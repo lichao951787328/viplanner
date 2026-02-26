@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-import numpy as np
-from skimage import graph 
 
 try:
     from plannernet.PlannerNet_myself_cubic import PlannerNetGrid
@@ -24,7 +22,7 @@ class TransformerPlanner(nn.Module):
         self.map_res = 0.1
         self.max_dist = max_dist
         self.step_size = step_size
-        self.max_k = int(math.ceil(10.0 / step_size)) 
+        self.max_k = 6 # 固定输出6个路径点（不依赖A*长度）
         
         # 2. CNN Backbone
         # 输出 [Batch, 512, 10, 10]
@@ -123,73 +121,4 @@ class TransformerPlanner(nn.Module):
         
         cost = self.cost_head(cls_token)
         
-        # 6. Mask Generation (关键修复)
-        # 如果外部没有传入真实距离(例如推理时)，必须在内部计算测地线距离
-        # 否则 U 型弯会被当成直线距离截断
-        if real_dist is None:
-            # 这里的 goal_norm 是归一化的，需要还原成米
-            goal_meters = goal_norm * self.max_dist
-            # 动态计算避障距离 (CPU 运算，推理时可接受)
-            dist_to_use = self._compute_geodesic_distance(x, goal_meters)
-        else:
-            dist_to_use = real_dist
-
-        num_valid_points = torch.ceil((dist_to_use / self.step_size) * 1.1).long()
-        num_valid_points = num_valid_points.clamp(min=1, max=self.max_k)
-        
-        indices = torch.arange(self.max_k, device=x.device).unsqueeze(0).expand(B, -1)
-        padding_mask = indices >= num_valid_points.unsqueeze(1)
-        
-        return out_path, cost, padding_mask
-
-    def _compute_geodesic_distance(self, map_tensor, goals):
-        """
-        计算实际避障距离。
-        注意：这个函数运行在 CPU 上，且包含循环，只建议在推理或 Validation 时使用。
-        训练时建议在 DataLoader 中预计算好 real_dist 并传入，以提高速度。
-        """
-        batch_size = map_tensor.shape[0]
-        distances = []
-        
-        maps_np = map_tensor.squeeze(1).detach().cpu().numpy()
-        goals_np = goals.detach().cpu().numpy()
-        
-        center_idx = (self.map_size // 2, self.map_size // 2)
-
-        for i in range(batch_size):
-            grid = maps_np[i] 
-            g_x, g_y = goals_np[i] 
-            
-            # 欧氏距离作为 fallback
-            euclidean = np.linalg.norm([g_x, g_y])
-            
-            # 坐标转换
-            row_idx = int(round(center_idx[0] - (g_x / self.map_res)))
-            col_idx = int(round(center_idx[1] - (g_y / self.map_res)))
-            target_node = (np.clip(row_idx, 0, self.map_size - 1),
-                           np.clip(col_idx, 0, self.map_size - 1))
-
-            # 简易 Cost Grid
-            cost_grid = np.ones_like(grid)
-            cost_grid[grid > 0.5] = 1000.0 
-
-            try:
-                # 检查起点终点是否在障碍物里
-                if cost_grid[center_idx] > 100 or cost_grid[target_node] > 100:
-                    dist = euclidean * 1.2 # 在墙里，勉强给个值
-                else:
-                    indices, weight = graph.route_through_array(
-                        cost_grid, start=center_idx, end=target_node, 
-                        fully_connected=True, geometric=True
-                    )
-                    dist = weight * self.map_res
-                    
-                    # 异常值处理
-                    if dist > self.max_dist * 4:
-                        dist = euclidean
-            except:
-                dist = euclidean 
-            
-            distances.append(dist)
-
-        return torch.tensor(distances, device=map_tensor.device, dtype=torch.float32)
+        return out_path, cost, None

@@ -74,7 +74,7 @@ def parse_camera_pose(txt_path):
 # --- 3. 主测试逻辑 ---
 def main():
     # 根目录
-    base_dir = "/home/eai/VLN/viplanner/rotated_out/carla/"
+    base_dir = "/home/lichao/viplanner/rotated_out/carla"
     
     # 搜索所有 sample 文件夹
     sample_dirs = sorted(glob.glob(os.path.join(base_dir, "sample_*")))

@@ -309,11 +309,8 @@ class CollectData(Dataset):
         else:
             base_map = base_map  # 不添加障碍物，保持原图
         # 6. 计算实际路程 (米)
-        # 传入当前的最终地图、起点、终点
-        # 这个地方暂时不用这么精确的计算，直接改成欧式距离
-        # path_length_m = np.linalg.norm(np.array(goal_pos) - np.array(start_pos)) * 0.1  # 要乘分辨率
-        
-        path_pixel_raw, path_dist, path_length_m = self._generate_raw_astar_path(base_map, start_pos, goal_pos)
+        # fixed10版本：不再运行A*，仅使用起终点欧氏距离
+        path_length_m = np.linalg.norm(np.array(goal_pos) - np.array(start_pos)) * 0.1
         
         # path_length_m = self._compute_path_length(base_map, start_pos, goal_pos)
         # path_length_m = _compute_geodesic_distance(base_map, start_pos, goal_pos)  # 使用地理距离计算
@@ -328,8 +325,9 @@ class CollectData(Dataset):
         map_tensor = torch.from_numpy(base_map).float().unsqueeze(0)  # [1, H, W]
         goal_tensor = torch.tensor(goal_pos, dtype=torch.float32)    # [2]
         dist_tensor = torch.tensor(path_length_m, dtype=torch.float32)  # [1] (标量)
-        path_pixel_raw_tensor = torch.tensor(path_pixel_raw, dtype=torch.float32)  # [N, 2]
-        path_dist_tensor = torch.tensor(path_dist, dtype=torch.float32)  # [N] (标量)
+        # 占位返回，保持与现有训练脚本接口一致
+        path_pixel_raw_tensor = torch.zeros((1, 2), dtype=torch.float32)
+        path_dist_tensor = torch.zeros((1,), dtype=torch.float32)
         return map_tensor, goal_tensor, dist_tensor, path_pixel_raw_tensor, path_dist_tensor
     
     

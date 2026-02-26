@@ -53,15 +53,15 @@ print(f"[INFO] Added parent path: {parent_dir}")
 # ==========================================
 try:
     # A. 导入同级目录下的文件 (假设 trainer_dataset.py 也在 utils 里)
-    from trainer_dataset import CollectData
+    from trainer_dataset_fixed10 import CollectData
 
     # B. 导入父目录下的模块 (现在可以直接从文件夹名开始了)
     # 对应: .../viplanner/plannernet/autoencoder_myself_cubic.py
-    from plannernet.autoencoder_myself_cubic_dj import AutoEncoderGrid
-    from plannernet.planner_transformer import TransformerPlanner
+    from plannernet.autoencoder_myself_cubic_dj_fixed10 import AutoEncoderGrid
+    from plannernet.planner_transformer_fixed10 import TransformerPlanner
     
     # 对应: .../viplanner/traj_cost_opt/traj_cost_myself_cubic.py
-    from traj_cost_opt.traj_cost_myself_cubic import TrajCost
+    from traj_cost_opt.traj_cost_myself_cubic_alignfalse import TrajCost
 
 
 except ImportError as e:
@@ -87,8 +87,15 @@ class Config:
         rotated_out_dir = os.path.join(project_root, "rotated_out", "carla")
         
         self.data_root = os.path.join(rotated_out_dir, "samples")
-        self.save_dir = os.path.join(rotated_out_dir, "checkpoints_v2")
-        self.log_dir = os.path.join(rotated_out_dir, "logs_v2")
+
+        # A/B/C 实验开关（单次运行建议只选一个）
+        # A: 现有 loss + 混合障碍风险
+        # B: A + 单步进展约束 Lprog
+        # C: B + 长度比约束 Llen
+        self.exp_variant = "A"
+
+        self.save_dir = os.path.join(rotated_out_dir, f"checkpoints_v2_alignfalse_fixed10_{self.exp_variant}")
+        self.log_dir = os.path.join(rotated_out_dir, f"logs_v2_alignfalse_fixed10_{self.exp_variant}")
         # self.data_root = "/home/eai/VLN/viplanner/rotated_out/carla/samples"  # 数据路径
         # self.save_dir = "/home/eai/VLN/viplanner/rotated_out/carla/checkpoints_v2"      # 模型保存路径
         # self.log_dir = "/home/eai/VLN/viplanner/rotated_out/carla/logs_v2"              # 可视化结果保存路径
@@ -109,9 +116,26 @@ class Config:
         # 损失权重 (传给 TrajCost)
         self.w_obs = 5       # 障碍物避让权重
         self.w_goal = 5       # 到达目标权重
-        self.w_motion = 10     # 平滑/动态权重
+        self.w_motion = 14     # 平滑/动态权重
         self.w_guide = 2      # 引导点权重 (新添加)
         self.fear_ahead_dist = 2.0
+
+        # --- A/B/C 损失参数 ---
+        # A: 混合障碍风险
+        self.obs_topk_ratio = 0.15
+        self.obs_safe_threshold = 0.8
+        self.obs_mean_alpha = 0.3
+        self.obs_topk_beta = 0.4
+        self.obs_max_gamma = 0.4
+        self.obs_barrier_delta = 0.3
+
+        # B: 进展约束
+        self.w_prog = 1.0
+        self.prog_margin = 0.02
+
+        # C: 长度比约束
+        self.w_len = 0.5
+        self.len_ratio_target = 1.25
         
         self.robot_width = 0.6     # 机器人宽度 (米)，用于计算左右边界点
         global Debug
@@ -142,6 +166,17 @@ class BatchTrajCost(TrajCost):
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.exp_variant = "A"
+        self.obs_topk_ratio = 0.15
+        self.obs_safe_threshold = 0.8
+        self.obs_mean_alpha = 0.3
+        self.obs_topk_beta = 0.4
+        self.obs_max_gamma = 0.4
+        self.obs_barrier_delta = 0.1
+        self.w_prog = 1.0
+        self.prog_margin = 0.02
+        self.w_len = 0.3
+        self.len_ratio_target = 1.25
         
     def Pos2IndNormal_Batch(self, points, H, W):
         """
@@ -161,8 +196,11 @@ class BatchTrajCost(TrajCost):
         col_idx = c_col - (py / res)
         
         # 像素 -> 归一化 [-1, 1] (grid_sample 使用 x=col, y=row)
-        norm_col = 2.0 * (col_idx / (W - 1)) - 1.0
-        norm_row = 2.0 * (row_idx / (H - 1)) - 1.0
+        # align_corners=False 对应“像素中心”映射：
+        # x_norm = 2 * ((x + 0.5) / W) - 1
+        # y_norm = 2 * ((y + 0.5) / H) - 1
+        norm_col = 2.0 * ((col_idx + 0.5) / W) - 1.0
+        norm_row = 2.0 * ((row_idx + 0.5) / H) - 1.0
         
         # Stack 为 (x, y) 即 (col, row)
         grid = torch.stack((norm_col, norm_row), dim=-1)
@@ -248,10 +286,50 @@ class BatchTrajCost(TrajCost):
 
         valid_len_3x = torch.cat([valid_dense_len, valid_dense_len, valid_dense_len], dim=0).float()
         
-        # 求和并除以该轨迹的有效长度 (平均 Cost)
-        # 避免除以 0，加个 epsilon
-        oloss = torch.sum(oloss_per_point, dim=1) / (valid_len_3x + 1e-6)
-        oloss = torch.mean(oloss)
+        # A 组：混合障碍风险（mean + topk + max + barrier）
+        valid_len_3x_int = valid_len_3x.long().clamp(min=1)
+        n_rows = oloss_per_point.shape[0]
+        mean_list, topk_list, max_list, barrier_list = [], [], [], []
+
+        for i in range(n_rows):
+            curr_len = int(valid_len_3x_int[i].item())
+            valid_vals = oloss_per_point[i, :curr_len]
+
+            curr_mean = torch.mean(valid_vals)
+            curr_max = torch.max(valid_vals)
+
+            topk_k = max(1, int(curr_len * self.obs_topk_ratio))
+            topk_vals, _ = torch.topk(valid_vals, k=topk_k, largest=True)
+            curr_topk = torch.mean(topk_vals)
+            # valid_vals：轨迹上每个有效采样点的障碍代价值
+            # self.obs_safe_threshold：你定义的“安全阈值”（比如 0.8）
+            # valid_vals - threshold：超过阈值多少
+            # relu(...)：只保留超过阈值的部分；低于阈值直接记 0（不罚）
+            # ** 2：超得越多，惩罚增长更快（平方惩罚）
+            # mean(...)：对这条轨迹所有有效点求平均
+            # 所以它的含义是：
+            # 只惩罚“危险区”点，且越危险惩罚越大；安全区不惩罚。
+            # 直观看：
+            # 若某点 cost = 0.6，阈值 0.8 → 惩罚 0
+            # 若某点 cost = 1.0，阈值 0.8 → 惩罚 (1.0−0.8) 2=0.04
+            # 若某点 cost = 1.5，阈值 0.8 → 惩罚 (1.5−0.8) 2=0.49（大很多）
+            curr_barrier = torch.mean(torch.relu(valid_vals - self.obs_safe_threshold) ** 2)
+            mean_list.append(curr_mean)
+            topk_list.append(curr_topk)
+            max_list.append(curr_max)
+            barrier_list.append(curr_barrier)
+
+        oloss_mean = torch.mean(torch.stack(mean_list))
+        oloss_topk = torch.mean(torch.stack(topk_list))
+        oloss_max = torch.mean(torch.stack(max_list))
+        oloss_barrier = torch.mean(torch.stack(barrier_list))
+
+        oloss = (
+            self.obs_mean_alpha * oloss_mean
+            + self.obs_topk_beta * oloss_topk
+            + self.obs_max_gamma * oloss_max
+            + self.obs_barrier_delta * oloss_barrier
+        )
 
         # ============================================================
         # 3. Goal Loss (取真正的最后一个有效点)
@@ -337,7 +415,7 @@ class BatchTrajCost(TrajCost):
         # 防止轨迹为了均匀而故意画蛇添足绕大圈
         dist_to_goal = torch.norm(goal[:, :2], dim=1) 
         l_reg = torch.mean(current_path_len / (dist_to_goal + 1e-6)) 
-        mloss += 0.05 * l_reg
+        mloss += 0.1 * l_reg
         
         # ============================================================
         # 5. Guide Loss (基于比例对齐 - 纯 Tensor 实现)
@@ -426,8 +504,29 @@ class BatchTrajCost(TrajCost):
         #     total_valid_elements = torch.sum(valid_dense_len) * 2
         #     loss_guide = sum_se / (total_valid_elements + 1e-6)
         
-        # Total Loss 不使用引导权重试试
+        # B 组：单步进展约束（防绕圈）
+        dist_to_goal_seq = torch.norm(goal[:, None, :2] - waypoints[:, :, :2], dim=2)  # [B, N]
+        delta_progress = dist_to_goal_seq[:, 1:] - dist_to_goal_seq[:, :-1]  # [B, N-1]
+        prog_penalty = torch.relu(delta_progress + self.prog_margin)
+        prog_penalty = prog_penalty.masked_fill(seg_mask, 0.0)
+        lprog = torch.mean(torch.sum(prog_penalty, dim=1) / num_segments)
+
+        # C 组：长度比约束（抑制大绕圈）
+        if distance is not None:
+            d_geo = distance.float().to(device).view(-1)
+        else:
+            d_geo = torch.norm(goal[:, :2], dim=1)
+        d_geo = torch.clamp(d_geo, min=1e-3)
+        len_ratio = current_path_len / d_geo
+        llen = torch.mean(torch.relu(len_ratio - self.len_ratio_target) ** 2)
+
+        # Total Loss：按 A/B/C 组合
         trajectory_loss = self.w_obs * oloss + self.w_goal * gloss + self.w_motion * mloss
+        exp_mode = str(self.exp_variant).upper()
+        if exp_mode in ["B", "C"]:
+            trajectory_loss = trajectory_loss + self.w_prog * lprog
+        if exp_mode == "C":
+            trajectory_loss = trajectory_loss + self.w_len * llen
         # + self.w_guide * loss_guide
 
         # ============================================================
@@ -487,7 +586,7 @@ class BatchTrajCost(TrajCost):
             # pdb.set_trace()
         fear_loss = torch.nn.BCELoss()(fear, is_collision)
 
-        return trajectory_loss + 0.1 * fear_loss, trajectory_loss, self.w_motion * mloss, fear_loss
+        return trajectory_loss + 0.1 * fear_loss, trajectory_loss, self.w_motion * mloss, fear_loss, lprog, llen
     # , self.w_guide * loss_guide
     
     def _compute_oloss_batch(self, waypoints, batch_maps):
@@ -776,12 +875,12 @@ def train_pipeline():
         writer = SummaryWriter(log_dir=cfg.log_dir + '/tb')
     
     stage_goals = {
-        0: {'target_loss': 1.132, 'collision_rate': 0.1, 'min_epochs': 450},  # Stage 0 只要 Motion Loss 很低
-        1: {'target_loss': 1.188, 'collision_rate': 0.1, 'min_epochs': 320},  # Stage 0 只要 Motion Loss 很低
-        2: {'target_loss': 1.65, 'collision_rate': 0.061, 'min_epochs': 300}, # Stage 1 碰撞率低于 10%
-        3: {'target_loss': 1.55, 'collision_rate': 0.07, 'min_epochs': 500},
-        4: {'target_loss': 1.5, 'collision_rate': 0.07, 'min_epochs': 100},
-        5: {'target_loss': 1.4, 'collision_rate': 0.07, 'min_epochs': 100}
+        0: {'target_loss': 3.2, 'collision_rate': 0.12, 'min_epochs': 200},
+        1: {'target_loss': 3.23, 'collision_rate': 0.10, 'min_epochs': 220},
+        2: {'target_loss': 3.42, 'collision_rate': 0.08, 'min_epochs': 200},
+        3: {'target_loss': 4.89, 'collision_rate': 0.07, 'min_epochs': 300},
+        4: {'target_loss': 4.1, 'collision_rate': 0.06, 'min_epochs': 260},
+        5: {'target_loss': 3.2, 'collision_rate': 0.06, 'min_epochs': 260}
     }
     
     # --- A. 数据集准备 (使用 Config 参数) ---
@@ -898,6 +997,20 @@ def train_pipeline():
         w_guide=cfg.w_guide,
         obstalce_thread=cfg.fear_ahead_dist
     )
+    batch_traj_cost.exp_variant = cfg.exp_variant
+    batch_traj_cost.obs_topk_ratio = cfg.obs_topk_ratio
+    batch_traj_cost.obs_safe_threshold = cfg.obs_safe_threshold
+    batch_traj_cost.obs_mean_alpha = cfg.obs_mean_alpha
+    batch_traj_cost.obs_topk_beta = cfg.obs_topk_beta
+    batch_traj_cost.obs_max_gamma = cfg.obs_max_gamma
+    batch_traj_cost.obs_barrier_delta = cfg.obs_barrier_delta
+    batch_traj_cost.w_prog = cfg.w_prog
+    batch_traj_cost.prog_margin = cfg.prog_margin
+    batch_traj_cost.w_len = cfg.w_len
+    batch_traj_cost.len_ratio_target = cfg.len_ratio_target
+
+    if local_rank == 0:
+        print(f"[INFO] Experiment Variant: {cfg.exp_variant}")
     map_proc = MapProcessor()
 
     # --- D. 训练循环 ---
@@ -935,17 +1048,13 @@ def train_pipeline():
         #     # 去掉了那个奇怪的 "-20"
         #     # 计算总共有多少个台阶
         #     total_steps = (target_epoch - pretrain_epoch) // step_size
-            
         #     # 防止除以零 (如果总轮数差不足20轮，直接设为满权重或做特殊处理)
         #     if total_steps < 1:
-        #         total_steps = 1
-                
+        #         total_steps = 1   
         #     # 当前在第几个台阶
         #     current_step = (epoch - pretrain_epoch) // step_size
-            
         #     # 计算 alpha (0.0 -> 1.0)
         #     alpha = min(current_step / total_steps, 1.0)
-            
         #     batch_traj_cost.w_obs = cfg.w_obs
         #     batch_traj_cost.w_goal = cfg.w_goal
         #     batch_traj_cost.w_motion = cfg.w_motion * alpha
@@ -1226,7 +1335,7 @@ def train_pipeline():
             # 注意，这里忽略的scale,其实实际存储的地图是81*81,但是后面统一resize成80,在求距离时，并没有更改，但是缩放比例接近1：1,这个地方先不改了
             # --- 计算 Loss (Batch) ---
             # loss, l_traj, l_motion, l_fear, l_guide = batch_traj_cost.CostofTraj_Batch(
-            loss, l_traj, l_motion, l_fear = batch_traj_cost.CostofTraj_Batch(
+            loss, l_traj, l_motion, l_fear, lprog, llen = batch_traj_cost.CostofTraj_Batch(
                 waypoints=waypoints,
                 goal=goal_meters,
                 fear=pred_fear,
@@ -1246,6 +1355,8 @@ def train_pipeline():
                 writer.add_scalar('Loss/Train_Traj', l_traj.item(), epoch * len(train_loader) + batch_idx)
                 writer.add_scalar('Loss/Train_Motion', l_motion.item(), epoch * len(train_loader) + batch_idx)
                 writer.add_scalar('Loss/Train_Fear', l_fear.item(), epoch * len(train_loader) + batch_idx)
+                writer.add_scalar('Loss/Train_Lprog', lprog.item(), epoch * len(train_loader) + batch_idx)
+                writer.add_scalar('Loss/Train_Llen', llen.item(), epoch * len(train_loader) + batch_idx)
                 # writer.add_scalar('Loss/Train_Guide', l_guide.item(), epoch * len(train_loader) + batch_idx)
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -1283,6 +1394,8 @@ def train_pipeline():
         
         model.eval()
         val_loss_total = 0.0
+        val_lprog_total = 0.0
+        val_llen_total = 0.0
         with torch.no_grad():
             for batch_idx, (map_tensor, goal_tensor, distance_tensor, path_pixel_raw_tensor, path_dist_tensor) in enumerate(val_loader):
                 # 同样的预处理流程
@@ -1330,7 +1443,7 @@ def train_pipeline():
                 total_samples += waypoints.shape[0]
                 
                 # loss, _, __, ___, ____ = batch_traj_cost.CostofTraj_Batch(
-                loss, _, __, ___ = batch_traj_cost.CostofTraj_Batch(
+                loss, _, __, ___, lprog_val, llen_val = batch_traj_cost.CostofTraj_Batch(
                     waypoints=waypoints,
                     goal=goal_meters,
                     fear=pred_fear,
@@ -1344,6 +1457,8 @@ def train_pipeline():
                     path_dist_tensor=path_dist_tensor.to(device)
                 )
                 val_loss_total += loss.item()
+                val_lprog_total += lprog_val.item()
+                val_llen_total += llen_val.item()
                 
                 if batch_idx % 100 == 0 and local_rank == 0:
                     visualize_debug(
@@ -1368,7 +1483,9 @@ def train_pipeline():
             train_loss_total, 
             val_loss_total, 
             collided_samples, 
-            total_samples
+            total_samples,
+            val_lprog_total,
+            val_llen_total,
         ], dtype=torch.float32, device=device)
         
         if use_ddp:
@@ -1385,6 +1502,8 @@ def train_pipeline():
         global_val_loss = metrics_tensor[1].item()
         global_collided = metrics_tensor[2].item()
         global_total = metrics_tensor[3].item()
+        global_val_lprog = metrics_tensor[4].item()
+        global_val_llen = metrics_tensor[5].item()
         
         # world_size = dist.get_world_size()
         
@@ -1395,6 +1514,8 @@ def train_pipeline():
         
         avg_train_loss = global_train_loss / (len(train_loader) * world_size)
         avg_val_loss = global_val_loss / (len(val_loader) * world_size)
+        avg_val_lprog = global_val_lprog / (len(val_loader) * world_size)
+        avg_val_llen = global_val_llen / (len(val_loader) * world_size)
         val_collision_rate = global_collided / global_total if global_total > 0 else 0.0
         # [修改点 1]：在所有 Rank 上都计算碰撞率，不要放在 if local_rank == 0 里
         # 假设 total_samples 和 collided_samples 在之前的步骤中已经做过 all_reduce (汇总) 或者即使是局部的也足以作为判断依据
@@ -1403,6 +1524,8 @@ def train_pipeline():
         # [修改点 2]：只让 Rank 0 负责打印日志和写 TensorBoard
         if local_rank == 0:
             writer.add_scalar('Loss/Val_Total', avg_val_loss, epoch)
+            writer.add_scalar('Loss/Val_Lprog', avg_val_lprog, epoch)
+            writer.add_scalar('Loss/Val_Llen', avg_val_llen, epoch)
             writer.add_scalar('Metrics/Val_CollisionRate', val_collision_rate, epoch)
     
         # [修改点 3]：阶段判断逻辑必须在主干道上（不要缩进到 local_rank==0 里）
